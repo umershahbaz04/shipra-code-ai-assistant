@@ -23,8 +23,10 @@ STATUS_IDS = {
     "in_transit": "22",
     "cancelled": "17",
     "out_for_delivery": "5",
-    # Same predicate as the verified dashboard InProgress query: exclude 6 and 26.
-    "in_progress": ",".join(str(value) for value in range(1, 29) if value not in {6, 26}),
+    # User-approved operational definition: exclude terminal/return statuses
+    # Delivered(6), Refunded(7), Exchanged(8), PendingForReturn(9), Returned(10),
+    # Cancelled(17), Lost(23), Damage(24), ReturnToOrigin(26).
+    "in_progress": "1,2,3,4,5,11,12,13,14,15,16,18,19,20,21,22,25,27,28",
 }
 PAYMENT_STATUS_IDS = {"all": None, "unpaid": 1, "paid": 2}
 
@@ -206,7 +208,7 @@ def structured_live_answer(question: str, history) -> str | None:
             else:
                 payload, updated_auth = api.order_by_reference(intent.order_reference)
             st.session_state.shipra_auth = updated_auth
-            return format_order_detail(payload)
+            return format_order_detail(payload, language=intent.language)
         if intent.operation == "count" and intent.status == "in_progress":
             fetch_limit = 1000
         else:
