@@ -19,6 +19,7 @@ ALLOWED_DATE_MODES = {
     "previous_calendar_month", "absolute_range", "ambiguous",
 }
 ALLOWED_LANGUAGES = {"English", "Roman Urdu", "Arabic"}
+ALLOWED_PAYMENT_STATUSES = {"all", "unpaid", "paid"}
 
 
 @dataclass(frozen=True)
@@ -35,6 +36,7 @@ class OrderIntent:
     needs_clarification: bool = False
     clarification: str = ""
     order_reference: str | None = None
+    payment_status: str = "all"
 
 
 def _json_object(text: str) -> dict[str, Any]:
@@ -57,29 +59,52 @@ def _validate(raw: dict[str, Any]) -> OrderIntent:
     if not is_order_query:
         return OrderIntent(is_order_query=False)
 
-    operation = str(raw.get("operation", "")).lower()
-    status = str(raw.get("status", "")).lower()
-    date_mode = str(raw.get("date_mode", "")).lower()
-    language = str(raw.get("language", "English"))
-    confidence = float(raw.get("confidence", 0))
     needs_clarification = raw.get("needs_clarification") is True
+    operation = str(raw.get("operation") or "count").lower()
+    status = str(raw.get("status") or "all").lower()
+    if status == "pending":
+        status = "in_progress"
+        needs_clarification = True
+    date_mode = str(raw.get("date_mode") or "all_time").lower()
+    language = str(raw.get("language", "English"))
+    confidence = float(raw.get("confidence", 0) or 0)
     clarification = str(raw.get("clarification") or "").strip()
     order_reference = str(raw.get("order_reference") or "").strip() or None
+    payment_status = str(raw.get("payment_status") or "all").lower()
 
     if operation not in ALLOWED_OPERATIONS:
-        raise ValueError("Unsupported order operation.")
+        if needs_clarification:
+            operation = "count"
+        else:
+            raise ValueError("Unsupported order operation.")
     if status not in ALLOWED_STATUSES:
-        raise ValueError("Unsupported order status.")
+        if needs_clarification:
+            status = "all"
+        else:
+            raise ValueError("Unsupported order status.")
     if date_mode not in ALLOWED_DATE_MODES:
-        raise ValueError("Unsupported date mode.")
+        if needs_clarification:
+            date_mode = "all_time"
+        else:
+            raise ValueError("Unsupported date mode.")
     if language not in ALLOWED_LANGUAGES:
         language = "English"
+    if payment_status not in ALLOWED_PAYMENT_STATUSES:
+        if needs_clarification:
+            payment_status = "all"
+        else:
+            raise ValueError("Unsupported payment status.")
     if not 0 <= confidence <= 1:
         raise ValueError("Invalid confidence value.")
 
     date_value = raw.get("date_value")
     if date_value is not None:
-        date_value = int(date_value)
+        if isinstance(date_value, str):
+            digits = "".join(character for character in date_value if character.isdigit())
+            date_value = int(digits) if digits else None
+        else:
+            date_value = int(date_value)
+    if date_value is not None:
         if not 1 <= date_value <= 366:
             raise ValueError("Date range must be between 1 and 366 days.")
     if date_mode == "last_n_days" and date_value is None:
@@ -116,6 +141,7 @@ def _validate(raw: dict[str, Any]) -> OrderIntent:
         needs_clarification=needs_clarification,
         clarification=clarification,
         order_reference=order_reference,
+        payment_status=payment_status,
     )
 
 
@@ -142,20 +168,26 @@ Schema:
   "language": "English"|"Roman Urdu"|"Arabic",
   "confidence": number from 0 to 1,
   "needs_clarification": boolean,
-  "clarification": string
-  "order_reference": string|null
+  "clarification": string,
+  "order_reference": string|null,
+  "payment_status": "all"|"unpaid"|"paid"
 }}
 
 Rules:
 - Understand spelling mistakes, paraphrases, English, Roman Urdu, Urdu script, and Arabic.
 - Use recent conversation only to resolve follow-ups such as "and how many returned?".
-- Generic "pending" is ambiguous in Shipra: it may mean in_progress or pending_for_return.
+- Generic order/tracking "pending" is ambiguous in Shipra: it may mean in_progress or pending_for_return.
   Set needs_clarification=true and ask which one the user means. Explicit "in progress"
   maps to in_progress; explicit "pending for return" maps to pending_for_return.
-- "last N days/weeks/months" means rolling N*1/N*7/N*30 days including today.
-- Bare durations such as "2 din k", "1 week k", or "ek mahina" also mean rolling periods.
+- Payment wording such as "payment pending", "not paid", "unpaid", or "has not paid yet"
+  maps to payment_status=unpaid and status=all. It is never an in_progress tracking query.
+- "paid payment" maps to payment_status=paid.
+- "last N days/weeks" means rolling N*1/N*7 days including today.
+- Bare durations such as "2 din k" or "1 week k" also mean rolling periods.
 - "previous month" means previous_calendar_month.
-- "last month" without an explicit "30 days" is ambiguous: request clarification between previous calendar month and rolling 30 days.
+- Any month wording ("1 month", "ek mahina", or "last month") without explicit "30 days"
+  or "previous calendar month" is ambiguous: request clarification between the previous
+  calendar month and rolling 30 days.
 - If no date was requested, use all_time.
 - If the user asks to show/dikhao/list orders, operation is list; if asking how many/kitny/count, it is count.
 - For one specific order's details/status/tracking, use operation=detail and copy its UUID/order number into order_reference. If no reference is supplied, request clarification.
