@@ -192,23 +192,66 @@ class ShipraAPI:
             raise ShipraAPIError("The count API returned no recognizable count field.")
         return count, self.auth.as_dict()
 
-    def list_orders(self, from_date: date | None, to_date: date | None, search: str = "", limit: int = 50) -> tuple[dict[str, Any], dict[str, str]]:
+    def list_orders(
+        self,
+        from_date: date | None,
+        to_date: date | None,
+        search: str = "",
+        limit: int = 50,
+        start: int = 0,
+        carrier_tracking_status_ids: str | None = None,
+    ) -> tuple[dict[str, Any], dict[str, str]]:
         body = {
             "filterModel": {
                 "createdFrom": from_date.isoformat() if from_date else None,
                 "createdTo": to_date.isoformat() if to_date else None,
-                "start": 0,
-                "length": min(max(limit, 1), 50),
+                "start": max(start, 0),
+                "length": min(max(limit, 1), 100),
                 "search": search,
                 "sortDir": "desc",
                 "sortCol": 0,
             },
             "orderRequestVia": 0,
             "readyForAssignment": True,
+            "carrierTrackingStatusIds": carrier_tracking_status_ids,
             "orderAddressFilter": {},
         }
         payload = self._request("POST", "Order/GetAllOrders", json_body=body)
         return {"count": _find_count(payload), "rows": _find_rows(payload), "raw": payload}, self.auth.as_dict()
+
+    def search_orders(
+        self,
+        from_date: date | None,
+        to_date: date | None,
+        *,
+        carrier_tracking_status_ids: str | None = None,
+        fetch_limit: int = 50,
+    ) -> tuple[dict[str, Any], dict[str, str]]:
+        """Return one consistently filtered count/list result, paging when requested."""
+        fetch_limit = min(max(fetch_limit, 1), 1000)
+        page_size = min(fetch_limit, 100)
+        rows: list[dict[str, Any]] = []
+        total: int | float | None = None
+        start = 0
+        while len(rows) < fetch_limit:
+            page, _ = self.list_orders(
+                from_date,
+                to_date,
+                limit=min(page_size, fetch_limit - len(rows)),
+                start=start,
+                carrier_tracking_status_ids=carrier_tracking_status_ids,
+            )
+            page_rows = page.get("rows") or []
+            page_total = page.get("count")
+            if total is None:
+                total = page_total if page_total is not None else len(page_rows)
+            elif page_total is not None and page_total != total:
+                raise ShipraAPIError("Order total changed while paging; please retry for a consistent result.")
+            rows.extend(page_rows)
+            start += len(page_rows)
+            if not page_rows or start >= int(total or 0):
+                break
+        return {"count": total or 0, "rows": rows, "complete": len(rows) >= int(total or 0)}, self.auth.as_dict()
 
     def order_by_id(self, order_id: str) -> tuple[dict[str, Any], dict[str, str]]:
         payload = self._request("GET", f"Order/GetOrderById?OrderId={order_id}")
