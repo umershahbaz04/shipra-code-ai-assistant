@@ -1,19 +1,31 @@
-import os
 import re
-from datetime import date, timedelta
 from pathlib import Path
 
 import streamlit as st
 from groq import Groq
 from rag_engine import ShipraRag
+from intent_parser import OrderIntent, parse_order_intent, resolve_date_range
 from shipra_api import (
     ShipraAPI,
     ShipraAPIError,
     format_order_detail,
     format_order_rows,
-    filter_in_progress_rows,
-    live_order_intent,
 )
+
+STATUS_IDS = {
+    "all": None,
+    "delivered": "6",
+    "returned": "10",
+    "refunded": "7",
+    "pending_for_return": "9",
+    "order_placed": "1",
+    "on_hold": "13",
+    "in_transit": "22",
+    "cancelled": "17",
+    "out_for_delivery": "5",
+    # Same predicate as the verified dashboard InProgress query: exclude 6 and 26.
+    "in_progress": ",".join(str(value) for value in range(1, 29) if value not in {6, 26}),
+}
 
 st.set_page_config(page_title="Shipra Code Assistant", page_icon="🤖", layout="wide")
 
@@ -91,60 +103,6 @@ SOURCES:\n{context}'''
     )
     return text + "\n\n### Verified sources\n" + sources
 
-def _live_date_range(question: str) -> tuple[date | None, date | None, bool]:
-    """Return an inclusive date range and whether a temporal phrase was parsed."""
-    today = date.today()
-    text = question.lower()
-    number_words = {
-        "aik": 1, "ek": 1, "one": 1, "do": 2, "two": 2,
-        "teen": 3, "three": 3, "char": 4, "four": 4,
-        "panch": 5, "five": 5, "saat": 7, "seven": 7,
-    }
-    number_pattern = r"(\d{1,3}|aik|ek|one|do|two|teen|three|char|four|panch|five|saat|seven)"
-    unit_pattern = r"(days?|din|weeks?|haft(?:a|ay|e|y)|months?|mahin(?:a|ay|e|y))"
-    patterns = [
-        rf"\b(?:last|past|previous|akhri|pichl[aeiy]*)\s+{number_pattern}\s+{unit_pattern}\b",
-        rf"\b{number_pattern}\s+{unit_pattern}(?:\s+(?:k|ka|ke|ki|mein|mai|main))?\b",
-    ]
-    duration = next((match for pattern in patterns if (match := re.search(pattern, text))), None)
-    if duration:
-        raw_number, unit = duration.group(1), duration.group(2)
-        amount = int(raw_number) if raw_number.isdigit() else number_words[raw_number]
-        amount = max(1, min(amount, 366))
-        if re.fullmatch(r"weeks?|haft(?:a|ay|e|y)", unit):
-            days = amount * 7
-        elif re.fullmatch(r"months?|mahin(?:a|ay|e|y)", unit):
-            days = amount * 30
-        else:
-            days = amount
-        # Inclusive: 2 days means today plus the previous day.
-        return today - timedelta(days=days - 1), today, True
-    if re.search(r"\b(yesterday|kal)\b", text):
-        yesterday = today - timedelta(days=1)
-        return yesterday, yesterday, True
-    if re.search(r"\b(today|aaj|aj)\b", text):
-        return today, today, True
-    return None, None, False
-
-def _has_temporal_hint(question: str) -> bool:
-    return bool(re.search(
-        r"\b(today|aaj|aj|yesterday|kal|last|past|previous|akhri|pichl[aeiy]*|days?|din|weeks?|haft(?:a|ay|e|y)|months?|mahin(?:a|ay|e|y))\b",
-        question.lower(),
-    ))
-
-def _unparsed_date_message(language: str) -> str:
-    if language == "Arabic":
-        return "لم أتمكن من تحديد الفترة الزمنية بدقة، لذلك لم يتم استدعاء واجهة الطلبات. استخدم صيغة مثل: آخر 5 أيام."
-    if language == "Roman Urdu":
-        return "Date range exact samajh nahi aayi, is liye order API call nahi ki gayi. Misal: `akhri 5 din` ya `1 week`."
-    return "I could not determine the exact date range, so the order API was not called. Try: `last 5 days` or `1 week`."
-
-def _has_recent_order_context(history) -> bool:
-    for message in reversed(history[-6:]):
-        if message.get("role") == "user" and re.search(r"\b(order|orders|آرڈر|طلبات|الطلبات)\b", message.get("content", ""), re.IGNORECASE):
-            return True
-    return False
-
 def _date_scope(from_date, to_date, language: str) -> str:
     if not from_date or not to_date:
         return "تمام الفترات" if language == "Arabic" else ("all time" if language == "English" else "all time")
@@ -157,63 +115,95 @@ def _connect_message(language: str) -> str:
         return "Live order data ke liye pehle sidebar se apna Shipra account connect karein."
     return "Connect your Shipra account from the sidebar first to access live order data."
 
-def live_answer(question: str, history) -> str | None:
-    intent = live_order_intent(question, order_context=_has_recent_order_context(history[:-1]))
-    if not intent:
+def _clarification_message(intent: OrderIntent) -> str:
+    if intent.clarification:
+        return intent.clarification
+    if intent.language == "Arabic":
+        return "يرجى توضيح حالة الطلب والفترة الزمنية المطلوبة."
+    if intent.language == "Roman Urdu":
+        return "Order status aur date range clear karein taa-ke exact result diya ja sake."
+    return "Please clarify the order status and date range so I can return an exact result."
+
+def _status_label(status: str, language: str) -> str:
+    english = {
+        "all": "orders", "delivered": "delivered orders", "in_progress": "in-progress orders",
+        "returned": "returned orders", "refunded": "refunded orders",
+        "pending_for_return": "orders pending for return", "order_placed": "order-placed orders",
+        "on_hold": "on-hold orders", "in_transit": "in-transit orders",
+        "cancelled": "cancelled orders", "out_for_delivery": "out-for-delivery orders",
+    }
+    return english[status]
+
+def _validated_live_result(data, intent: OrderIntent):
+    expected_ids = STATUS_IDS[intent.status]
+    if expected_ids is None:
+        return
+    allowed = {int(value) for value in expected_ids.split(",")}
+    for row in data.get("rows") or []:
+        raw = row.get("CarrierTrackingStatusId", row.get("carrierTrackingStatusId"))
+        if raw is None:
+            # The API may omit the id; verify exact single-status queries by name.
+            name = str(row.get("CarrierTrackingStatus", row.get("carrierTrackingStatus", ""))).lower().replace(" ", "")
+            exact_names = {"delivered": "delivered", "returned": "returned", "refunded": "refunded"}
+            expected_name = exact_names.get(intent.status)
+            if expected_name and name != expected_name:
+                raise ShipraAPIError("Shipra returned a row outside the requested status filter.")
+            continue
+        if int(raw) not in allowed:
+            raise ShipraAPIError("Shipra returned a row outside the requested status filter.")
+
+def structured_live_answer(question: str, history) -> str | None:
+    try:
+        intent = parse_order_intent(st.secrets["GROQ_API_KEY"], question, history[:-1])
+    except Exception as exc:
+        likely_order = bool(re.search(r"order|parcel|shipment|آرڈر|طلب", question, re.IGNORECASE))
+        if likely_order:
+            return f"Order request could not be interpreted safely: `{type(exc).__name__}`. No Shipra API call was made."
         return None
-    language = response_language(question)
+    if not intent.is_order_query:
+        return None
+    if intent.needs_clarification:
+        return _clarification_message(intent)
+
     auth = st.session_state.get("shipra_auth")
     if not auth:
-        return _connect_message(language)
-
-    api = ShipraAPI(shipra_base_url(), auth=auth)
-    from_date, to_date, parsed_date = _live_date_range(question)
-    if _has_temporal_hint(question) and not parsed_date:
-        return _unparsed_date_message(language)
+        return _connect_message(intent.language)
     try:
-        if intent["action"] == "count":
-            count, updated_auth = api.count_orders(intent["kind"], from_date, to_date)
-            st.session_state.shipra_auth = updated_auth
-            labels = {
-                "total": "orders",
-                "delivered": "delivered orders",
-                "in_progress": "in-progress orders",
-                "returned": "returned orders",
-                "regular": "regular orders",
-                "fulfillable": "fulfillable orders",
-                "to_be_packed": "orders to be packed",
-                "to_be_shipped": "orders to be shipped",
-            }
-            label = labels[intent["kind"]]
-            scope = _date_scope(from_date, to_date, language)
-            if language == "Arabic":
-                arabic_labels = {"total": "طلباً", "delivered": "طلباً تم تسليمه", "in_progress": "طلباً قيد التنفيذ", "returned": "طلباً مرتجعاً"}
-                return f"وفقاً لواجهة Shipra المباشرة، يوجد **{count} {arabic_labels.get(intent['kind'], 'طلباً')}** خلال {scope}."
-            if language == "Roman Urdu":
-                return f"Live Shipra API ke mutabiq {scope} **{count} {label}** hain."
-            return f"According to the live Shipra API, there are **{count} {label}** {scope}."
-
-        if intent["action"] == "detail":
-            payload, updated_auth = api.order_by_id(intent["order_id"])
+        from_date, to_date = resolve_date_range(intent)
+        api = ShipraAPI(shipra_base_url(), auth=auth)
+        if intent.operation == "detail":
+            if not intent.order_reference:
+                return _clarification_message(intent)
+            if re.fullmatch(r"[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}", intent.order_reference, re.IGNORECASE):
+                payload, updated_auth = api.order_by_id(intent.order_reference)
+            else:
+                payload, updated_auth = api.order_by_reference(intent.order_reference)
             st.session_state.shipra_auth = updated_auth
             return format_order_detail(payload)
-
-        if intent["action"] == "detail_search":
-            payload, updated_auth = api.order_by_reference(intent["reference"])
-            st.session_state.shipra_auth = updated_auth
-            return format_order_detail(payload)
-
-        data, updated_auth = api.list_orders(from_date, to_date)
+        fetch_limit = 1 if intent.operation == "count" else 1000
+        data, updated_auth = api.search_orders(
+            from_date,
+            to_date,
+            carrier_tracking_status_ids=STATUS_IDS[intent.status],
+            fetch_limit=fetch_limit,
+        )
         st.session_state.shipra_auth = updated_auth
-        labels = {"total": "orders", "in_progress": "pending/in-progress orders", "delivered": "delivered orders", "returned": "returned orders"}
-        if intent["kind"] == "in_progress":
-            exact_count, updated_auth = api.count_orders("in_progress", from_date, to_date)
-            st.session_state.shipra_auth = updated_auth
-            data["rows"] = filter_in_progress_rows(data.get("rows") or [])
-            data["count"] = exact_count
-        return format_order_rows(data, limit=50, language=language, label=labels.get(intent["kind"], "orders"))
-    except ShipraAPIError as exc:
-        return f"Shipra live-data request failed safely: `{exc}`"
+        _validated_live_result(data, intent)
+        count = data["count"]
+        label = _status_label(intent.status, intent.language)
+        scope = _date_scope(from_date, to_date, intent.language)
+        if intent.operation == "count":
+            if intent.language == "Roman Urdu":
+                return f"Live Shipra API ke mutabiq {scope} **{count} {label}** hain."
+            if intent.language == "Arabic":
+                return f"وفقاً لواجهة Shipra المباشرة، العدد هو **{count}** خلال {scope}."
+            return f"According to the live Shipra API, there are **{count} {label}** {scope}."
+        result = format_order_rows(data, limit=1000, language=intent.language, label=label)
+        if not data.get("complete"):
+            result += "\n\nResult was safely limited; not every matching row was downloaded."
+        return result
+    except (ShipraAPIError, ValueError) as exc:
+        return f"Shipra live-data request stopped safely: `{exc}`"
 
 st.title("Shipra Code Assistant")
 st.caption("Public guest mode • Chats are temporary and never shared")
@@ -256,7 +246,7 @@ if q := st.chat_input("Ask about Shipra code..."):
     with st.chat_message("assistant"):
         with st.spinner("Searching verified source..."):
             try:
-                out = live_answer(q, st.session_state.history)
+                out = structured_live_answer(q, st.session_state.history)
                 if out is None:
                     out = answer(q, st.session_state.history[-8:])
             except Exception as exc: out = f"Source search failed safely: `{type(exc).__name__}`"
