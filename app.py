@@ -91,20 +91,53 @@ SOURCES:\n{context}'''
     )
     return text + "\n\n### Verified sources\n" + sources
 
-def _live_date_range(question: str) -> tuple[date | None, date | None]:
+def _live_date_range(question: str) -> tuple[date | None, date | None, bool]:
+    """Return an inclusive date range and whether a temporal phrase was parsed."""
     today = date.today()
     text = question.lower()
-    last_days = re.search(r"\b(?:last|past|pichl[aeiy]*)\s+(\d{1,3})\s+(?:days?|din)\b", text)
-    if last_days:
-        days = max(1, min(int(last_days.group(1)), 366))
-        # Inclusive range: "last 2 days" means today and yesterday.
-        return today - timedelta(days=days - 1), today
+    number_words = {
+        "aik": 1, "ek": 1, "one": 1, "do": 2, "two": 2,
+        "teen": 3, "three": 3, "char": 4, "four": 4,
+        "panch": 5, "five": 5, "saat": 7, "seven": 7,
+    }
+    number_pattern = r"(\d{1,3}|aik|ek|one|do|two|teen|three|char|four|panch|five|saat|seven)"
+    unit_pattern = r"(days?|din|weeks?|haft(?:a|ay|e|y)|months?|mahin(?:a|ay|e|y))"
+    patterns = [
+        rf"\b(?:last|past|previous|akhri|pichl[aeiy]*)\s+{number_pattern}\s+{unit_pattern}\b",
+        rf"\b{number_pattern}\s+{unit_pattern}(?:\s+(?:k|ka|ke|ki|mein|mai|main))?\b",
+    ]
+    duration = next((match for pattern in patterns if (match := re.search(pattern, text))), None)
+    if duration:
+        raw_number, unit = duration.group(1), duration.group(2)
+        amount = int(raw_number) if raw_number.isdigit() else number_words[raw_number]
+        amount = max(1, min(amount, 366))
+        if re.fullmatch(r"weeks?|haft(?:a|ay|e|y)", unit):
+            days = amount * 7
+        elif re.fullmatch(r"months?|mahin(?:a|ay|e|y)", unit):
+            days = amount * 30
+        else:
+            days = amount
+        # Inclusive: 2 days means today plus the previous day.
+        return today - timedelta(days=days - 1), today, True
     if re.search(r"\b(yesterday|kal)\b", text):
         yesterday = today - timedelta(days=1)
-        return yesterday, yesterday
+        return yesterday, yesterday, True
     if re.search(r"\b(today|aaj|aj)\b", text):
-        return today, today
-    return None, None
+        return today, today, True
+    return None, None, False
+
+def _has_temporal_hint(question: str) -> bool:
+    return bool(re.search(
+        r"\b(today|aaj|aj|yesterday|kal|last|past|previous|akhri|pichl[aeiy]*|days?|din|weeks?|haft(?:a|ay|e|y)|months?|mahin(?:a|ay|e|y))\b",
+        question.lower(),
+    ))
+
+def _unparsed_date_message(language: str) -> str:
+    if language == "Arabic":
+        return "لم أتمكن من تحديد الفترة الزمنية بدقة، لذلك لم يتم استدعاء واجهة الطلبات. استخدم صيغة مثل: آخر 5 أيام."
+    if language == "Roman Urdu":
+        return "Date range exact samajh nahi aayi, is liye order API call nahi ki gayi. Misal: `akhri 5 din` ya `1 week`."
+    return "I could not determine the exact date range, so the order API was not called. Try: `last 5 days` or `1 week`."
 
 def _has_recent_order_context(history) -> bool:
     for message in reversed(history[-6:]):
@@ -134,7 +167,9 @@ def live_answer(question: str, history) -> str | None:
         return _connect_message(language)
 
     api = ShipraAPI(shipra_base_url(), auth=auth)
-    from_date, to_date = _live_date_range(question)
+    from_date, to_date, parsed_date = _live_date_range(question)
+    if _has_temporal_hint(question) and not parsed_date:
+        return _unparsed_date_message(language)
     try:
         if intent["action"] == "count":
             count, updated_auth = api.count_orders(intent["kind"], from_date, to_date)
