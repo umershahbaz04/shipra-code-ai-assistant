@@ -1,15 +1,26 @@
 import os
-from pathlib import Path
 import re
+from datetime import date, timedelta
+from pathlib import Path
 
 import streamlit as st
 from groq import Groq
 from rag_engine import ShipraRag
+from shipra_api import (
+    ShipraAPI,
+    ShipraAPIError,
+    format_order_detail,
+    format_order_rows,
+    live_order_intent,
+)
 
 st.set_page_config(page_title="Shipra Code Assistant", page_icon="🤖", layout="wide")
 
 @st.cache_resource
 def load_engine(): return ShipraRag(Path(__file__).resolve().parent / "data")
+
+def shipra_base_url() -> str:
+    return st.secrets.get("SHIPRA_API_BASE_URL", "https://stage-api.shipra.io/api/")
 
 def response_language(question: str) -> str:
     """Choose the response language from an explicit request, then the question."""
@@ -78,13 +89,103 @@ SOURCES:\n{context}'''
     )
     return text + "\n\n### Verified sources\n" + sources
 
+def _live_date_range(question: str) -> tuple[date, date]:
+    today = date.today()
+    text = question.lower()
+    if re.search(r"\b(yesterday|kal)\b", text):
+        yesterday = today - timedelta(days=1)
+        return yesterday, yesterday
+    if re.search(r"\b(today|aaj|aj)\b", text):
+        return today, today
+    return today - timedelta(days=30), today
+
+def _connect_message(language: str) -> str:
+    if language == "Arabic":
+        return "يرجى ربط حساب Shipra من الشريط الجانبي أولاً للوصول إلى بيانات الطلبات المباشرة."
+    if language == "Roman Urdu":
+        return "Live order data ke liye pehle sidebar se apna Shipra account connect karein."
+    return "Connect your Shipra account from the sidebar first to access live order data."
+
+def live_answer(question: str) -> str | None:
+    intent = live_order_intent(question)
+    if not intent:
+        return None
+    language = response_language(question)
+    auth = st.session_state.get("shipra_auth")
+    if not auth:
+        return _connect_message(language)
+
+    api = ShipraAPI(shipra_base_url(), auth=auth)
+    from_date, to_date = _live_date_range(question)
+    try:
+        if intent["action"] == "count":
+            count, updated_auth = api.count_orders(intent["kind"], from_date, to_date)
+            st.session_state.shipra_auth = updated_auth
+            labels = {
+                "total": "orders",
+                "delivered": "delivered orders",
+                "in_progress": "in-progress orders",
+                "returned": "returned orders",
+                "regular": "regular orders",
+                "fulfillable": "fulfillable orders",
+                "to_be_packed": "orders to be packed",
+                "to_be_shipped": "orders to be shipped",
+            }
+            label = labels[intent["kind"]]
+            if language == "Arabic":
+                return f"وفقاً لواجهة Shipra المباشرة، العدد هو: **{count}** ({from_date} إلى {to_date})."
+            if language == "Roman Urdu":
+                return f"Live Shipra API ke mutabiq {from_date} se {to_date} tak **{count} {label}** hain."
+            return f"According to the live Shipra API, there are **{count} {label}** from {from_date} to {to_date}."
+
+        if intent["action"] == "detail":
+            payload, updated_auth = api.order_by_id(intent["order_id"])
+            st.session_state.shipra_auth = updated_auth
+            return format_order_detail(payload)
+
+        if intent["action"] == "detail_search":
+            payload, updated_auth = api.order_by_reference(intent["reference"])
+            st.session_state.shipra_auth = updated_auth
+            return format_order_detail(payload)
+
+        data, updated_auth = api.list_orders(from_date, to_date)
+        st.session_state.shipra_auth = updated_auth
+        return format_order_rows(data)
+    except ShipraAPIError as exc:
+        return f"Shipra live-data request failed safely: `{exc}`"
+
 st.title("Shipra Code Assistant")
 st.caption("Public guest mode • Chats are temporary and never shared")
 if "history" not in st.session_state: st.session_state.history = []
 with st.sidebar:
     if st.button("New chat", use_container_width=True):
         st.session_state.history = []; st.rerun()
-    st.caption("Answers are grounded in the indexed source snapshot.")
+    st.caption("Code answers use the indexed source snapshot.")
+    st.divider()
+    st.subheader("Connect Shipra")
+    if st.session_state.get("shipra_auth"):
+        st.success(f"Connected as {st.session_state.shipra_auth.get('username', 'Shipra user')}")
+        if st.button("Disconnect Shipra", use_container_width=True):
+            st.session_state.pop("shipra_auth", None)
+            st.rerun()
+    else:
+        with st.form("shipra_login", clear_on_submit=True):
+            username = st.text_input("Shipra username")
+            password = st.text_input("Shipra password", type="password")
+            connect = st.form_submit_button("Connect account", use_container_width=True)
+        if connect:
+            if not username or not password:
+                st.error("Username and password are required.")
+            else:
+                try:
+                    st.session_state.shipra_auth = ShipraAPI(shipra_base_url()).login(username, password)
+                    st.success("Shipra account connected.")
+                    st.rerun()
+                except ShipraAPIError as exc:
+                    st.error(str(exc))
+                except Exception:
+                    st.error("Could not connect to Shipra API.")
+        st.caption("Credentials are used for login only and are not stored in chat history.")
 
 for msg in st.session_state.history:
     with st.chat_message(msg["role"]): st.markdown(msg["content"])
@@ -93,7 +194,10 @@ if q := st.chat_input("Ask about Shipra code..."):
     with st.chat_message("user"): st.markdown(q)
     with st.chat_message("assistant"):
         with st.spinner("Searching verified source..."):
-            try: out = answer(q, st.session_state.history[-8:])
+            try:
+                out = live_answer(q)
+                if out is None:
+                    out = answer(q, st.session_state.history[-8:])
             except Exception as exc: out = f"Source search failed safely: `{type(exc).__name__}`"
         st.markdown(out)
     st.session_state.history.append({"role":"assistant","content":out})
