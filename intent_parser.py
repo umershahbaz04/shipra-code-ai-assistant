@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, timedelta
 from typing import Any
 
@@ -223,3 +223,30 @@ def resolve_date_range(intent: OrderIntent) -> tuple[date | None, date | None]:
     if intent.date_mode == "absolute_range":
         return date.fromisoformat(intent.from_date or ""), date.fromisoformat(intent.to_date or "")
     raise ValueError("Ambiguous date range cannot be executed.")
+
+
+def resolve_clarification_reply(intent: OrderIntent, reply: str) -> OrderIntent | None:
+    """Resolve common clarification replies without another LLM request."""
+    text = " ".join(reply.lower().strip().split())
+    resolved = intent
+    changed = False
+
+    if intent.status == "in_progress" and intent.needs_clarification:
+        if text in {"progress", "in progress", "in-progress", "jo progress mai hain", "jo abi progress mai hain"}:
+            resolved = replace(resolved, status="in_progress")
+            changed = True
+        elif text in {"pending for return", "return pending", "pending return", "return"}:
+            resolved = replace(resolved, status="pending_for_return")
+            changed = True
+
+    if intent.date_mode == "ambiguous":
+        if text in {"30 days", "last 30 days", "rolling 30 days", "30 din", "akhri 30 din"}:
+            resolved = replace(resolved, date_mode="last_n_days", date_value=30)
+            changed = True
+        elif text in {"previous month", "previous calendar month", "last calendar month", "pichla mahina", "pichlay mahiny"}:
+            resolved = replace(resolved, date_mode="previous_calendar_month", date_value=None)
+            changed = True
+
+    if not changed:
+        return None
+    return replace(resolved, needs_clarification=False, clarification="", confidence=1.0)
