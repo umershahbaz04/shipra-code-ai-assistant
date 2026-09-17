@@ -94,6 +94,11 @@ SOURCES:\n{context}'''
 def _live_date_range(question: str) -> tuple[date | None, date | None]:
     today = date.today()
     text = question.lower()
+    last_days = re.search(r"\b(?:last|past|pichl[aeiy]*)\s+(\d{1,3})\s+(?:days?|din)\b", text)
+    if last_days:
+        days = max(1, min(int(last_days.group(1)), 366))
+        # Inclusive range: "last 2 days" means today and yesterday.
+        return today - timedelta(days=days - 1), today
     if re.search(r"\b(yesterday|kal)\b", text):
         yesterday = today - timedelta(days=1)
         return yesterday, yesterday
