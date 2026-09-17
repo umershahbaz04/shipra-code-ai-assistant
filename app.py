@@ -11,6 +11,7 @@ from shipra_api import (
     ShipraAPIError,
     format_order_detail,
     format_order_rows,
+    filter_in_progress_rows,
     live_order_intent,
 )
 
@@ -27,11 +28,12 @@ def response_language(question: str) -> str:
     normalized = question.lower()
 
     # An explicitly requested language always wins, even for an English question.
-    if re.search(r"\b(answer|reply|explain|response|jawab|samjha(?:o|do)|bata(?:o|do))\b.{0,50}\b(arabic|arab|العربية)\b", normalized):
+    instruction = r"(?:answer|reply|explain|response|jawab|samjha(?:o|do)|bata(?:o|do)|mai|mein|me|in)"
+    if re.search(rf"(?:\b{instruction}\b.{{0,50}}\b(?:arabic|arab)\b|\b(?:arabic|arab)\b.{{0,50}}\b{instruction}\b|العربية)", normalized):
         return "Arabic"
-    if re.search(r"\b(answer|reply|explain|response|jawab|samjha(?:o|do)|bata(?:o|do))\b.{0,50}\b(roman\s*urdu|urdu|اردو)\b", normalized):
+    if re.search(rf"(?:\b{instruction}\b.{{0,50}}\b(?:roman\s*urdu|urdu)\b|\b(?:roman\s*urdu|urdu)\b.{{0,50}}\b{instruction}\b|اردو)", normalized):
         return "Roman Urdu"
-    if re.search(r"\b(answer|reply|explain|response|jawab|samjha(?:o|do)|bata(?:o|do))\b.{0,50}\benglish\b", normalized):
+    if re.search(rf"(?:\b{instruction}\b.{{0,50}}\benglish\b|\benglish\b.{{0,50}}\b{instruction}\b)", normalized):
         return "English"
 
     # Arabic script is answered in Arabic. Roman Urdu is detected from common
@@ -89,7 +91,7 @@ SOURCES:\n{context}'''
     )
     return text + "\n\n### Verified sources\n" + sources
 
-def _live_date_range(question: str) -> tuple[date, date]:
+def _live_date_range(question: str) -> tuple[date | None, date | None]:
     today = date.today()
     text = question.lower()
     if re.search(r"\b(yesterday|kal)\b", text):
@@ -97,7 +99,18 @@ def _live_date_range(question: str) -> tuple[date, date]:
         return yesterday, yesterday
     if re.search(r"\b(today|aaj|aj)\b", text):
         return today, today
-    return today - timedelta(days=30), today
+    return None, None
+
+def _has_recent_order_context(history) -> bool:
+    for message in reversed(history[-6:]):
+        if message.get("role") == "user" and re.search(r"\b(order|orders|آرڈر|طلبات|الطلبات)\b", message.get("content", ""), re.IGNORECASE):
+            return True
+    return False
+
+def _date_scope(from_date, to_date, language: str) -> str:
+    if not from_date or not to_date:
+        return "تمام الفترات" if language == "Arabic" else ("all time" if language == "English" else "all time")
+    return f"{from_date} se {to_date} tak" if language == "Roman Urdu" else f"{from_date} إلى {to_date}" if language == "Arabic" else f"from {from_date} to {to_date}"
 
 def _connect_message(language: str) -> str:
     if language == "Arabic":
@@ -106,8 +119,8 @@ def _connect_message(language: str) -> str:
         return "Live order data ke liye pehle sidebar se apna Shipra account connect karein."
     return "Connect your Shipra account from the sidebar first to access live order data."
 
-def live_answer(question: str) -> str | None:
-    intent = live_order_intent(question)
+def live_answer(question: str, history) -> str | None:
+    intent = live_order_intent(question, order_context=_has_recent_order_context(history[:-1]))
     if not intent:
         return None
     language = response_language(question)
@@ -132,11 +145,13 @@ def live_answer(question: str) -> str | None:
                 "to_be_shipped": "orders to be shipped",
             }
             label = labels[intent["kind"]]
+            scope = _date_scope(from_date, to_date, language)
             if language == "Arabic":
-                return f"وفقاً لواجهة Shipra المباشرة، العدد هو: **{count}** ({from_date} إلى {to_date})."
+                arabic_labels = {"total": "طلباً", "delivered": "طلباً تم تسليمه", "in_progress": "طلباً قيد التنفيذ", "returned": "طلباً مرتجعاً"}
+                return f"وفقاً لواجهة Shipra المباشرة، يوجد **{count} {arabic_labels.get(intent['kind'], 'طلباً')}** خلال {scope}."
             if language == "Roman Urdu":
-                return f"Live Shipra API ke mutabiq {from_date} se {to_date} tak **{count} {label}** hain."
-            return f"According to the live Shipra API, there are **{count} {label}** from {from_date} to {to_date}."
+                return f"Live Shipra API ke mutabiq {scope} **{count} {label}** hain."
+            return f"According to the live Shipra API, there are **{count} {label}** {scope}."
 
         if intent["action"] == "detail":
             payload, updated_auth = api.order_by_id(intent["order_id"])
@@ -150,7 +165,13 @@ def live_answer(question: str) -> str | None:
 
         data, updated_auth = api.list_orders(from_date, to_date)
         st.session_state.shipra_auth = updated_auth
-        return format_order_rows(data)
+        labels = {"total": "orders", "in_progress": "pending/in-progress orders", "delivered": "delivered orders", "returned": "returned orders"}
+        if intent["kind"] == "in_progress":
+            exact_count, updated_auth = api.count_orders("in_progress", from_date, to_date)
+            st.session_state.shipra_auth = updated_auth
+            data["rows"] = filter_in_progress_rows(data.get("rows") or [])
+            data["count"] = exact_count
+        return format_order_rows(data, limit=50, language=language, label=labels.get(intent["kind"], "orders"))
     except ShipraAPIError as exc:
         return f"Shipra live-data request failed safely: `{exc}`"
 
@@ -195,7 +216,7 @@ if q := st.chat_input("Ask about Shipra code..."):
     with st.chat_message("assistant"):
         with st.spinner("Searching verified source..."):
             try:
-                out = live_answer(q)
+                out = live_answer(q, st.session_state.history)
                 if out is None:
                     out = answer(q, st.session_state.history[-8:])
             except Exception as exc: out = f"Source search failed safely: `{type(exc).__name__}`"
