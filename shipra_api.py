@@ -180,20 +180,23 @@ class ShipraAPI:
             raise ShipraAPIError(_error_message(payload, f"Shipra API request failed ({response.status_code})."))
         return payload
 
-    def count_orders(self, kind: str, from_date: date, to_date: date) -> tuple[int | float, dict[str, str]]:
+    def count_orders(self, kind: str, from_date: date | None, to_date: date | None) -> tuple[int | float, dict[str, str]]:
         route = self.COUNT_ROUTES[kind]
-        body = {"filterModel": {"createdFrom": from_date.isoformat(), "createdTo": to_date.isoformat()}}
+        body = {"filterModel": {
+            "createdFrom": from_date.isoformat() if from_date else None,
+            "createdTo": to_date.isoformat() if to_date else None,
+        }}
         payload = self._request("POST", route, json_body=body)
         count = _find_count(payload)
         if count is None:
             raise ShipraAPIError("The count API returned no recognizable count field.")
         return count, self.auth.as_dict()
 
-    def list_orders(self, from_date: date, to_date: date, search: str = "", limit: int = 20) -> tuple[dict[str, Any], dict[str, str]]:
+    def list_orders(self, from_date: date | None, to_date: date | None, search: str = "", limit: int = 50) -> tuple[dict[str, Any], dict[str, str]]:
         body = {
             "filterModel": {
-                "createdFrom": from_date.isoformat(),
-                "createdTo": to_date.isoformat(),
+                "createdFrom": from_date.isoformat() if from_date else None,
+                "createdTo": to_date.isoformat() if to_date else None,
                 "start": 0,
                 "length": min(max(limit, 1), 50),
                 "search": search,
@@ -225,11 +228,12 @@ class ShipraAPI:
         return {"isSuccess": True, "result": row}, self.auth.as_dict()
 
 
-def live_order_intent(question: str) -> dict[str, str] | None:
+def live_order_intent(question: str, *, order_context: bool = False) -> dict[str, str] | None:
     text = question.lower().strip()
-    if not re.search(r"\borders?\b", text):
+    has_order_word = bool(re.search(r"\b(order|orders|orderon|orders?|آرڈر|طلب|طلبات|الطلبات)\b", text))
+    if not has_order_word and not order_context:
         return None
-    live_words = r"\b(today|aaj|aj|yesterday|kal|count|kitn[aei]|how many|show|list|details?|status|delivered|returned|pending|packed|shipped|tracking)\b"
+    live_words = r"\b(today|aaj|aj|yesterday|kal|count|kitn(?:a|e|i|y)|how many|show|list|details?|status|delivered|returned|pending|packed|shipped|tracking|total|kul)\b|كم|عدد|إجمالي"
     if not re.search(live_words, text):
         return None
 
@@ -249,7 +253,7 @@ def live_order_intent(question: str) -> dict[str, str] | None:
     count_kind = "total"
     if re.search(r"\b(delivered|deliver(?:ed)?|pohnch|pahunch)\b", text):
         count_kind = "delivered"
-    elif re.search(r"\b(in[ -]?progress|processing)\b", text):
+    elif re.search(r"\b(in[ -]?progress|processing|pending)\b", text):
         count_kind = "in_progress"
     elif re.search(r"\b(returned|return)\b", text):
         count_kind = "returned"
@@ -262,15 +266,39 @@ def live_order_intent(question: str) -> dict[str, str] | None:
     elif re.search(r"\b(ship|shipped|shipping)\b", text):
         count_kind = "to_be_shipped"
 
-    if re.search(r"\b(count|how many|kitn[aei])\b", text):
+    if re.search(r"\b(count|how many|kitn(?:a|e|i|y)|total|kul)\b|كم|عدد|إجمالي", text):
         return {"action": "count", "kind": count_kind}
     return {"action": "list", "kind": count_kind}
 
 
-def format_order_rows(data: dict[str, Any], limit: int = 10) -> str:
+def filter_in_progress_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Apply the same exclusions used by DashboardRepository.GetInProgressOrderCount."""
+    terminal_ids = {6, 26}  # Delivered, ReturnToOrigin
+    terminal_names = {"delivered", "returntoorigin", "return to origin"}
+    filtered: list[dict[str, Any]] = []
+    for row in rows:
+        raw_id = row.get("carrierTrackingStatusId", row.get("CarrierTrackingStatusId"))
+        raw_name = row.get("carrierTrackingStatus", row.get("CarrierTrackingStatus", ""))
+        try:
+            status_id = int(raw_id) if raw_id is not None else None
+        except (TypeError, ValueError):
+            status_id = None
+        status_name = re.sub(r"[_-]+", " ", str(raw_name)).strip().lower()
+        compact_name = status_name.replace(" ", "")
+        if status_id in terminal_ids or status_name in terminal_names or compact_name in terminal_names:
+            continue
+        filtered.append(row)
+    return filtered
+
+
+def format_order_rows(data: dict[str, Any], limit: int = 10, language: str = "English", label: str = "orders") -> str:
     rows = data.get("rows") or []
     count = data.get("count")
     if not rows:
+        if language == "Arabic":
+            return f"لم يتم العثور على طلبات مطابقة. العدد الإجمالي: {count or 0}."
+        if language == "Roman Urdu":
+            return f"Koi matching order nahi mila. Total count: {count or 0}."
         return f"No matching orders were returned. Total count: {count or 0}."
 
     preferred = [
@@ -279,7 +307,13 @@ def format_order_rows(data: dict[str, Any], limit: int = 10) -> str:
         "status", "Status", "carrierTrackingStatus", "CarrierTrackingStatus",
         "carrierTrackingNo", "CarrierTrackingNo",
     ]
-    lines = [f"Live Shipra API returned {count if count is not None else len(rows)} matching orders. Showing {min(len(rows), limit)}:"]
+    total = count if count is not None else len(rows)
+    if language == "Arabic":
+        lines = [f"أعادت واجهة Shipra المباشرة **{total}** من {label}. يتم عرض {min(len(rows), limit)}:"]
+    elif language == "Roman Urdu":
+        lines = [f"Live Shipra API ne **{total} {label}** return kiye. {min(len(rows), limit)} dikhaye ja rahe hain:"]
+    else:
+        lines = [f"Live Shipra API returned **{total} {label}**. Showing {min(len(rows), limit)}:"]
     for index, row in enumerate(rows[:limit], 1):
         selected = {key: row[key] for key in preferred if key in row and row[key] not in (None, "")}
         if not selected:
