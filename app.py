@@ -4,7 +4,7 @@ from pathlib import Path
 import streamlit as st
 from groq import Groq
 from rag_engine import ShipraRag
-from intent_parser import OrderIntent, parse_order_intent, resolve_date_range
+from intent_parser import OrderIntent, parse_order_intent, resolve_clarification_reply, resolve_date_range
 from shipra_api import (
     ShipraAPI,
     ShipraAPIError,
@@ -182,17 +182,23 @@ def _validated_live_result(data, intent: OrderIntent):
                 raise ShipraAPIError("Shipra returned a row outside the requested payment-status filter.")
 
 def structured_live_answer(question: str, history) -> str | None:
-    try:
-        intent = parse_order_intent(st.secrets["GROQ_API_KEY"], question, history[:-1])
-    except Exception:
-        likely_order = bool(re.search(r"order|parcel|shipment|payment|paid|unpaid|آرڈر|طلب", question, re.IGNORECASE))
-        if likely_order:
-            return "I could not determine the exact order filters safely. Please rephrase the status and date range; no Shipra API call was made."
-        return None
+    pending_intent = st.session_state.get("pending_order_intent")
+    intent = resolve_clarification_reply(pending_intent, question) if isinstance(pending_intent, OrderIntent) else None
+    if intent is None:
+        try:
+            intent = parse_order_intent(st.secrets["GROQ_API_KEY"], question, history[:-1])
+        except Exception:
+            likely_order = bool(re.search(r"order|parcel|shipment|payment|paid|unpaid|progress|return|آرڈر|طلب", question, re.IGNORECASE))
+            if pending_intent or likely_order:
+                return "Order request parser is temporarily unavailable. No Shipra API call was made; please retry shortly."
+            return None
     if not intent.is_order_query:
+        st.session_state.pop("pending_order_intent", None)
         return None
     if intent.needs_clarification:
+        st.session_state.pending_order_intent = intent
         return _clarification_message(intent)
+    st.session_state.pop("pending_order_intent", None)
 
     auth = st.session_state.get("shipra_auth")
     if not auth:
