@@ -200,6 +200,7 @@ class ShipraAPI:
         limit: int = 50,
         start: int = 0,
         carrier_tracking_status_ids: str | None = None,
+        payment_status_id: int | None = None,
     ) -> tuple[dict[str, Any], dict[str, str]]:
         body = {
             "filterModel": {
@@ -214,6 +215,7 @@ class ShipraAPI:
             "orderRequestVia": 0,
             "readyForAssignment": True,
             "carrierTrackingStatusIds": carrier_tracking_status_ids,
+            "paymentStatusId": payment_status_id,
             "orderAddressFilter": {},
         }
         payload = self._request("POST", "Order/GetAllOrders", json_body=body)
@@ -225,6 +227,7 @@ class ShipraAPI:
         to_date: date | None,
         *,
         carrier_tracking_status_ids: str | None = None,
+        payment_status_id: int | None = None,
         fetch_limit: int = 50,
     ) -> tuple[dict[str, Any], dict[str, str]]:
         """Return one consistently filtered count/list result, paging when requested."""
@@ -240,6 +243,7 @@ class ShipraAPI:
                 limit=min(page_size, fetch_limit - len(rows)),
                 start=start,
                 carrier_tracking_status_ids=carrier_tracking_status_ids,
+                payment_status_id=payment_status_id,
             )
             page_rows = page.get("rows") or []
             page_total = page.get("count")
