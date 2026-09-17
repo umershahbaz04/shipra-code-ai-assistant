@@ -227,7 +227,7 @@ def structured_live_answer(question: str, history) -> str | None:
             fetch_limit=fetch_limit,
         )
         st.session_state.shipra_auth = updated_auth
-        if intent.status == "in_progress" and not data.get("complete"):
+        if intent.operation == "count" and intent.status == "in_progress" and not data.get("complete"):
             raise ShipraAPIError(
                 "The in-progress result exceeded the safe validation limit, so its full status set could not be verified."
             )
