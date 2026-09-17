@@ -26,6 +26,7 @@ STATUS_IDS = {
     # Same predicate as the verified dashboard InProgress query: exclude 6 and 26.
     "in_progress": ",".join(str(value) for value in range(1, 29) if value not in {6, 26}),
 }
+PAYMENT_STATUS_IDS = {"all": None, "unpaid": 1, "paid": 2}
 
 st.set_page_config(page_title="Shipra Code Assistant", page_icon="🤖", layout="wide")
 
@@ -124,41 +125,67 @@ def _clarification_message(intent: OrderIntent) -> str:
         return "Order status aur date range clear karein taa-ke exact result diya ja sake."
     return "Please clarify the order status and date range so I can return an exact result."
 
-def _status_label(status: str, language: str) -> str:
+def _status_label(status: str, payment_status: str, count=None) -> str:
+    singular = count == 1
+    if payment_status == "unpaid":
+        return "unpaid order" if singular else "unpaid orders"
+    if payment_status == "paid":
+        return "paid order" if singular else "paid orders"
     english = {
-        "all": "orders", "delivered": "delivered orders", "in_progress": "in-progress orders",
-        "returned": "returned orders", "refunded": "refunded orders",
-        "pending_for_return": "orders pending for return", "order_placed": "order-placed orders",
-        "on_hold": "on-hold orders", "in_transit": "in-transit orders",
-        "cancelled": "cancelled orders", "out_for_delivery": "out-for-delivery orders",
+        "all": ("order", "orders"),
+        "delivered": ("delivered order", "delivered orders"),
+        "in_progress": ("dashboard in-progress order", "dashboard in-progress orders"),
+        "returned": ("returned order", "returned orders"),
+        "refunded": ("refunded order", "refunded orders"),
+        "pending_for_return": ("order pending for return", "orders pending for return"),
+        "order_placed": ("order-placed order", "order-placed orders"),
+        "on_hold": ("on-hold order", "on-hold orders"),
+        "in_transit": ("in-transit order", "in-transit orders"),
+        "cancelled": ("cancelled order", "cancelled orders"),
+        "out_for_delivery": ("out-for-delivery order", "out-for-delivery orders"),
     }
-    return english[status]
+    return english[status][0 if singular else 1]
 
 def _validated_live_result(data, intent: OrderIntent):
     expected_ids = STATUS_IDS[intent.status]
-    if expected_ids is None:
-        return
-    allowed = {int(value) for value in expected_ids.split(",")}
-    for row in data.get("rows") or []:
-        raw = row.get("CarrierTrackingStatusId", row.get("carrierTrackingStatusId"))
-        if raw is None:
-            # The API may omit the id; verify exact single-status queries by name.
+    if expected_ids is not None:
+        allowed = {int(value) for value in expected_ids.split(",")}
+        for row in data.get("rows") or []:
+            raw = row.get("CarrierTrackingStatusId", row.get("carrierTrackingStatusId"))
             name = str(row.get("CarrierTrackingStatus", row.get("carrierTrackingStatus", ""))).lower().replace(" ", "")
-            exact_names = {"delivered": "delivered", "returned": "returned", "refunded": "refunded"}
-            expected_name = exact_names.get(intent.status)
-            if expected_name and name != expected_name:
+            if raw is None:
+                exact_names = {"delivered": "delivered", "returned": "returned", "refunded": "refunded"}
+                expected_name = exact_names.get(intent.status)
+                if expected_name and name != expected_name:
+                    raise ShipraAPIError("Shipra returned a row outside the requested tracking-status filter.")
+                if intent.status == "in_progress" and name in {"refunded", "exchanged", "returned", "cancelled", "lost", "damage", "returntoorigin"}:
+                    raise ShipraAPIError(
+                        "Shipra's dashboard in-progress rule includes a terminal/exception status. "
+                        "This result was blocked instead of presenting it as an active order."
+                    )
+                continue
+            status_id = int(raw)
+            if status_id not in allowed:
                 raise ShipraAPIError("Shipra returned a row outside the requested status filter.")
-            continue
-        if int(raw) not in allowed:
-            raise ShipraAPIError("Shipra returned a row outside the requested status filter.")
+            if intent.status == "in_progress" and status_id in {7, 8, 9, 10, 17, 23, 24, 26}:
+                raise ShipraAPIError(
+                    "Shipra's dashboard in-progress rule includes a terminal/exception status. "
+                    "This result was blocked instead of presenting it as an active order."
+                )
+
+    if intent.payment_status != "all":
+        for row in data.get("rows") or []:
+            name = str(row.get("PaymentStatus", row.get("paymentStatus", ""))).strip().lower()
+            if name and name != intent.payment_status:
+                raise ShipraAPIError("Shipra returned a row outside the requested payment-status filter.")
 
 def structured_live_answer(question: str, history) -> str | None:
     try:
         intent = parse_order_intent(st.secrets["GROQ_API_KEY"], question, history[:-1])
-    except Exception as exc:
-        likely_order = bool(re.search(r"order|parcel|shipment|آرڈر|طلب", question, re.IGNORECASE))
+    except Exception:
+        likely_order = bool(re.search(r"order|parcel|shipment|payment|paid|unpaid|آرڈر|طلب", question, re.IGNORECASE))
         if likely_order:
-            return f"Order request could not be interpreted safely: `{type(exc).__name__}`. No Shipra API call was made."
+            return "I could not determine the exact order filters safely. Please rephrase the status and date range; no Shipra API call was made."
         return None
     if not intent.is_order_query:
         return None
@@ -180,17 +207,25 @@ def structured_live_answer(question: str, history) -> str | None:
                 payload, updated_auth = api.order_by_reference(intent.order_reference)
             st.session_state.shipra_auth = updated_auth
             return format_order_detail(payload)
-        fetch_limit = 1 if intent.operation == "count" else 1000
+        if intent.operation == "count" and intent.status == "in_progress":
+            fetch_limit = 1000
+        else:
+            fetch_limit = 1 if intent.operation == "count" else 50
         data, updated_auth = api.search_orders(
             from_date,
             to_date,
             carrier_tracking_status_ids=STATUS_IDS[intent.status],
+            payment_status_id=PAYMENT_STATUS_IDS[intent.payment_status],
             fetch_limit=fetch_limit,
         )
         st.session_state.shipra_auth = updated_auth
+        if intent.status == "in_progress" and not data.get("complete"):
+            raise ShipraAPIError(
+                "The in-progress result exceeded the safe validation limit, so its full status set could not be verified."
+            )
         _validated_live_result(data, intent)
         count = data["count"]
-        label = _status_label(intent.status, intent.language)
+        label = _status_label(intent.status, intent.payment_status, count)
         scope = _date_scope(from_date, to_date, intent.language)
         if intent.operation == "count":
             if intent.language == "Roman Urdu":
@@ -198,9 +233,9 @@ def structured_live_answer(question: str, history) -> str | None:
             if intent.language == "Arabic":
                 return f"وفقاً لواجهة Shipra المباشرة، العدد هو **{count}** خلال {scope}."
             return f"According to the live Shipra API, there are **{count} {label}** {scope}."
-        result = format_order_rows(data, limit=1000, language=intent.language, label=label)
+        result = format_order_rows(data, limit=50, language=intent.language, label=label)
         if not data.get("complete"):
-            result += "\n\nResult was safely limited; not every matching row was downloaded."
+            result += "\n\nOnly the first 50 matching orders are shown; the total count above is from the filtered Shipra API."
         return result
     except (ShipraAPIError, ValueError) as exc:
         return f"Shipra live-data request stopped safely: `{exc}`"
