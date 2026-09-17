@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import re
 from dataclasses import dataclass
 from datetime import date, timedelta
@@ -352,10 +351,8 @@ def format_order_rows(data: dict[str, Any], limit: int = 10, language: str = "En
         return f"No matching orders were returned. Total count: {count or 0}."
 
     preferred = [
-        "orderNo", "OrderNo", "orderId", "OrderId", "orderDate", "OrderDate",
-        "customerName", "CustomerName", "fullName", "FullName", "amount", "Amount",
+        "orderNo", "OrderNo", "orderDate", "OrderDate", "amount", "Amount",
         "status", "Status", "carrierTrackingStatus", "CarrierTrackingStatus",
-        "carrierTrackingNo", "CarrierTrackingNo",
     ]
     total = count if count is not None else len(rows)
     if language == "Arabic":
@@ -366,13 +363,67 @@ def format_order_rows(data: dict[str, Any], limit: int = 10, language: str = "En
         lines = [f"Live Shipra API returned **{total} {label}**. Showing {min(len(rows), limit)}:"]
     for index, row in enumerate(rows[:limit], 1):
         selected = {key: row[key] for key in preferred if key in row and row[key] not in (None, "")}
-        if not selected:
-            selected = dict(list(row.items())[:8])
-        summary = ", ".join(f"{key}: {value}" for key, value in selected.items())
+        summary = ", ".join(f"{key}: {value}" for key, value in selected.items()) or "No safe summary fields returned"
         lines.append(f"{index}. {summary}")
     return "\n".join(lines)
 
 
-def format_order_detail(payload: dict[str, Any]) -> str:
+def _mask_name(value: Any) -> str:
+    words = str(value or "").strip().split()
+    return " ".join(word[:1] + "*" * max(len(word) - 1, 2) for word in words) or "-"
+
+
+def _mask_phone(value: Any) -> str:
+    text = str(value or "").strip()
+    return ("*" * max(len(text) - 4, 4) + text[-4:]) if text else "-"
+
+
+def _mask_email(value: Any) -> str:
+    text = str(value or "").strip()
+    if "@" not in text:
+        return "-"
+    local, domain = text.split("@", 1)
+    return (local[:1] or "*") + "***@" + domain
+
+
+def format_order_detail(payload: dict[str, Any], language: str = "English") -> str:
+    """Render a privacy-safe order summary instead of exposing the raw API object."""
     result = payload.get("result", payload)
-    return "Live order details:\n\n```json\n" + json.dumps(result, indent=2, ensure_ascii=False, default=str)[:12000] + "\n```"
+    if not isinstance(result, dict):
+        raise ShipraAPIError("Shipra returned an unexpected order-detail format.")
+    order = result.get("order") or result.get("Order") or result
+    address = result.get("orderAddress") or result.get("OrderAddress") or {}
+    items = result.get("orderItems") or result.get("OrderItems") or []
+    if not isinstance(order, dict):
+        raise ShipraAPIError("Shipra returned no recognizable order object.")
+
+    payment_id = order.get("paymentStatusId", order.get("PaymentStatusId"))
+    payment_status = {1: "Unpaid", 2: "Paid"}.get(payment_id, str(payment_id or "-"))
+    reference = order.get("orderNo") or order.get("OrderNo") or order.get("refNo") or order.get("RefNo") or "-"
+    tracking = order.get("carrierTrackingStatus") or order.get("CarrierTrackingStatus") or "-"
+
+    lines = [
+        "Live order summary:",
+        f"- Order reference: **{reference}**",
+        f"- Order date: {order.get('orderDate', order.get('OrderDate', '-'))}",
+        f"- Amount: {order.get('amount', order.get('Amount', '-'))}",
+        f"- Payment status: {payment_status}",
+        f"- Tracking status: {tracking}",
+        f"- Items count: {order.get('itemsCount', order.get('ItemsCount', len(items) if isinstance(items, list) else '-'))}",
+        f"- Customer: {_mask_name(address.get('customerName', address.get('CustomerName', '')) if isinstance(address, dict) else '')}",
+        f"- Mobile: {_mask_phone(address.get('mobile1', address.get('Mobile1', '')) if isinstance(address, dict) else '')}",
+        f"- Email: {_mask_email(address.get('email', address.get('Email', '')) if isinstance(address, dict) else '')}",
+    ]
+    if isinstance(items, list) and items:
+        lines.append("- Items:")
+        for item in items[:10]:
+            if not isinstance(item, dict):
+                continue
+            name = item.get("productName") or item.get("ProductName") or "Unnamed item"
+            quantity = item.get("quantity", item.get("Quantity", "-"))
+            price = item.get("price", item.get("Price", "-"))
+            lines.append(f"  - {name} — quantity: {quantity}, price: {price}")
+        if len(items) > 10:
+            lines.append(f"  - {len(items) - 10} more item(s) hidden from the summary")
+    lines.append("\nSensitive address, full contact details, internal IDs, notes, and metadata are hidden by default.")
+    return "\n".join(lines)
