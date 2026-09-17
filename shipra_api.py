@@ -230,10 +230,13 @@ class ShipraAPI:
 
 def live_order_intent(question: str, *, order_context: bool = False) -> dict[str, str] | None:
     text = question.lower().strip()
-    has_order_word = bool(re.search(r"\b(order|orders|orderon|orders?|آرڈر|طلب|طلبات|الطلبات)\b", text))
+    # Normalize common typing variations before deterministic intent matching.
+    text = re.sub(r"\b(?:penidng|pening|pendng|panding)\b", "pending", text)
+    text = re.sub(r"\b(?:orde|ordr|oders)\b", "order", text)
+    has_order_word = bool(re.search(r"\b(order|orders|orderon|آرڈر|طلب|طلبات|الطلبات)\b", text))
     if not has_order_word and not order_context:
         return None
-    live_words = r"\b(today|aaj|aj|yesterday|kal|count|kitn(?:a|e|i|y)|how many|show|list|details?|status|delivered|returned|pending|penidng|packed|shipped|tracking|total|kul|last)\b|كم|عدد|إجمالي"
+    live_words = r"\b(today|aaj|aj|yesterday|kal|count|kitn(?:a|e|i|y)|how many|show|list|details?|status|deliver(?:ed)?|returned|pending|packed|shipped|tracking|total|kul|last|past|akhri|pichl[aeiy]*)\b|كم|عدد|إجمالي"
     if not re.search(live_words, text):
         return None
 
@@ -253,7 +256,7 @@ def live_order_intent(question: str, *, order_context: bool = False) -> dict[str
     count_kind = "total"
     if re.search(r"\b(delivered|deliver(?:ed)?|pohnch|pahunch)\b", text):
         count_kind = "delivered"
-    elif re.search(r"\b(in[ -]?progress|processing|pending|penidng)\b", text):
+    elif re.search(r"\b(in[ -]?progress|processing|pending)\b", text):
         count_kind = "in_progress"
     elif re.search(r"\b(returned|return)\b", text):
         count_kind = "returned"
