@@ -5,6 +5,9 @@ import streamlit as st
 from groq import Groq
 from rag_engine import ShipraRag
 from intent_parser import OrderIntent, parse_order_intent, resolve_clarification_reply, resolve_date_range
+from live_api_executor import execute_live_intent
+from live_api_intent import parse_live_api_intent
+from live_response_formatter import format_live_result
 from shipra_api import (
     ShipraAPI,
     ShipraAPIError,
@@ -319,6 +322,45 @@ def structured_live_answer(question: str, history) -> str | None:
     except (ShipraAPIError, ValueError) as exc:
         return f"Shipra live-data request stopped safely: `{exc}`"
 
+def structured_universal_live_answer(question: str, history) -> str | None:
+    try:
+        intent = parse_live_api_intent(
+            st.secrets["GROQ_API_KEY"],
+            question,
+            history[:-1],
+        )
+    except Exception:
+        return None
+
+    if not intent.is_live_query:
+        return None
+
+    if intent.needs_clarification:
+        return intent.clarification or "Please provide the required ID or clarify the requested live data."
+
+    auth = st.session_state.get("shipra_auth")
+    if not auth:
+        return _connect_message(intent.language)
+
+    try:
+        api = ShipraAPI(shipra_base_url(), auth=auth)
+        result = execute_live_intent(api, intent)
+        st.session_state.shipra_auth = result.auth
+        count_only = bool(
+            re.search(
+                r"\b(how many|count|total|kitne|kitny|kitna|kitni|kul)\b|کتنے|كم|عدد",
+                question,
+                re.IGNORECASE,
+            )
+        )
+        return format_live_result(
+            result,
+            intent.language,
+            count_only=count_only,
+        )
+    except (ShipraAPIError, ValueError) as exc:
+        return f"Shipra live-data request stopped safely: `{exc}`"
+
 st.title("Shipra Code Assistant")
 st.caption("Public guest mode • Chats are temporary and never shared")
 if "history" not in st.session_state: st.session_state.history = []
@@ -366,6 +408,13 @@ if q := st.chat_input("Ask about Shipra code..."):
                 # Agar store request nahi hai to order flow check hoga.
                 if out is None:
                     out = structured_live_answer(
+                        q,
+                        st.session_state.history,
+                    )
+
+                # Non-order verified live APIs check hongi.
+                if out is None:
+                    out = structured_universal_live_answer(
                         q,
                         st.session_state.history,
                     )
