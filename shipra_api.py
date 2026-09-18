@@ -191,6 +191,34 @@ class ShipraAPI:
             raise ShipraAPIError("The count API returned no recognizable count field.")
         return count, self.auth.as_dict()
 
+def count_stores(self) -> tuple[int, dict[str, str]]:
+    body = {
+        "filterModel": {
+            "createdFrom": None,
+            "createdTo": None,
+            "start": 0,
+            "length": 1,
+            "search": "",
+            "sortCol": 0,
+            "sortDir": "desc",
+        }
+    }
+
+    payload = self._request(
+        "POST",
+        "Store/GetAllStores",
+        json_body=body,
+    )
+
+    count = _find_count(payload)
+
+    if count is None:
+        raise ShipraAPIError(
+            "Store API returned no recognizable TotalCount."
+        )
+
+    return int(count), self.auth.as_dict()
+
     def list_orders(
         self,
         from_date: date | None,

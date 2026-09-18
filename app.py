@@ -118,6 +118,77 @@ def _connect_message(language: str) -> str:
         return "Live order data ke liye pehle sidebar se apna Shipra account connect karein."
     return "Connect your Shipra account from the sidebar first to access live order data."
 
+def structured_store_answer(question: str) -> str | None:
+    text = question.lower().strip()
+
+    has_store_word = bool(
+        re.search(
+            r"\b(store|stores|stor)\b|سٹور|متجر|متاجر",
+            text,
+            re.IGNORECASE,
+        )
+    )
+
+    has_count_word = bool(
+        re.search(
+            r"\b(how many|count|total|kitne|kitny|kitna|kitni|kul)\b"
+            r"|کتنے|كم|عدد",
+            text,
+            re.IGNORECASE,
+        )
+    )
+
+    # Store-count question nahi hai to normal order/RAG flow continue hoga.
+    if not has_store_word or not has_count_word:
+        return None
+
+    language = response_language(question)
+    auth = st.session_state.get("shipra_auth")
+
+    if not auth:
+        if language == "Arabic":
+            return "يرجى ربط حساب Shipra أولاً للوصول إلى بيانات المتاجر المباشرة."
+        if language == "Roman Urdu":
+            return (
+                "Live store data ke liye pehle sidebar se "
+                "apna Shipra account connect karein."
+            )
+        return (
+            "Connect your Shipra account from the sidebar "
+            "to access live store data."
+        )
+
+    try:
+        api = ShipraAPI(
+            shipra_base_url(),
+            auth=auth,
+        )
+
+        count, updated_auth = api.count_stores()
+
+        # Refreshed token session mein save rahega.
+        st.session_state.shipra_auth = updated_auth
+
+        if language == "Arabic":
+            return f"وفقاً لواجهة Shipra المباشرة، يوجد حالياً **{count} متجر**."
+
+        if language == "Roman Urdu":
+            return (
+                f"Live Shipra API ke mutabiq Shipra mein "
+                f"**{count} stores** hain."
+            )
+
+        store_label = "store" if count == 1 else "stores"
+
+        return (
+            f"According to the live Shipra API, "
+            f"there are **{count} {store_label}** in Shipra."
+        )
+
+    except ShipraAPIError as exc:
+        return f"Shipra store request stopped safely: `{exc}`"
+
+    
 def _clarification_message(intent: OrderIntent) -> str:
     if intent.clarification:
         return intent.clarification
@@ -289,9 +360,22 @@ if q := st.chat_input("Ask about Shipra code..."):
     with st.chat_message("assistant"):
         with st.spinner("Searching verified source..."):
             try:
-                out = structured_live_answer(q, st.session_state.history)
+                                # Pehle live store request check hogi.
+                out = structured_store_answer(q)
+
+                # Agar store request nahi hai to order flow check hoga.
                 if out is None:
-                    out = answer(q, st.session_state.history[-8:])
+                    out = structured_live_answer(
+                        q,
+                        st.session_state.history,
+                    )
+
+                # Agar live-data request nahi hai to RAG source search hogi.
+                if out is None:
+                    out = answer(
+                        q,
+                        st.session_state.history[-8:],
+                    )
             except Exception as exc: out = f"Source search failed safely: `{type(exc).__name__}`"
         st.markdown(out)
     st.session_state.history.append({"role":"assistant","content":out})
