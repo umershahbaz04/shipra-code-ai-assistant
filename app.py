@@ -222,6 +222,75 @@ def _status_label(status: str, payment_status: str, count=None) -> str:
     }
     return english[status][0 if singular else 1]
 
+def _format_store_order_counts(
+    data: dict,
+    language: str,
+) -> str:
+    total_count = int(
+        data.get("totalCount") or 0
+    )
+
+    stores = data.get("stores") or []
+
+    if language == "Arabic":
+        lines = [
+            (
+                f"إجمالي الطلبات هو "
+                f"**{total_count}**:"
+            )
+        ]
+    elif language == "Roman Urdu":
+        lines = [
+            (
+                f"Live Shipra API ke mutabiq "
+                f"total **{total_count} orders** hain:"
+            )
+        ]
+    else:
+        lines = [
+            (
+                f"According to the live Shipra API, "
+                f"there are **{total_count} orders**:"
+            )
+        ]
+
+    for index, store in enumerate(
+        stores,
+        start=1,
+    ):
+        store_name = store.get(
+            "storeName",
+            "Unknown store",
+        )
+
+        order_count = int(
+            store.get("orderCount") or 0
+        )
+
+        if language == "Arabic":
+            lines.append(
+                f"{index}. {store_name}: "
+                f"**{order_count} طلب**"
+            )
+        elif language == "Roman Urdu":
+            lines.append(
+                f"{index}. {store_name}: "
+                f"**{order_count} orders**"
+            )
+        else:
+            label = (
+                "order"
+                if order_count == 1
+                else "orders"
+            )
+
+            lines.append(
+                f"{index}. {store_name}: "
+                f"**{order_count} {label}**"
+            )
+
+    return "\n".join(lines)
+
 def _validated_live_result(data, intent: OrderIntent):
     expected_ids = STATUS_IDS[intent.status]
     if expected_ids is not None:
@@ -280,6 +349,30 @@ def structured_live_answer(question: str, history) -> str | None:
     try:
         from_date, to_date = resolve_date_range(intent)
         api = ShipraAPI(shipra_base_url(), auth=auth)
+        if intent.group_by == "store":
+            data, updated_auth = (
+                api.count_orders_by_store(
+                    from_date=from_date,
+                    to_date=to_date,
+                    carrier_tracking_status_ids=(
+                        STATUS_IDS[intent.status]
+                    ),
+                    payment_status_id=(
+                        PAYMENT_STATUS_IDS[
+                            intent.payment_status
+                        ]
+                    ),
+                )
+            )
+
+            st.session_state.shipra_auth = (
+                updated_auth
+            )
+
+            return _format_store_order_counts(
+                data,
+                intent.language,
+            )        
         if intent.operation == "detail":
             if not intent.order_reference:
                 return _clarification_message(intent)
