@@ -376,6 +376,10 @@ if q := st.chat_input("Ask about Shipra code..."):
                         q,
                         st.session_state.history[-8:],
                     )
-            except Exception as exc: out = f"Source search failed safely: `{type(exc).__name__}`"
+            except Exception as exc:
+                out = (
+                    f"Source search failed safely: "
+                    f"`{type(exc).__name__}: {str(exc)}`"
+                )
         st.markdown(out)
     st.session_state.history.append({"role":"assistant","content":out})
