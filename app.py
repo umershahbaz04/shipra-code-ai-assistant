@@ -360,7 +360,7 @@ if q := st.chat_input("Ask about Shipra code..."):
     with st.chat_message("assistant"):
         with st.spinner("Searching verified source..."):
             try:
-                                # Pehle live store request check hogi.
+                # Pehle live store request check hogi.
                 out = structured_store_answer(q)
 
                 # Agar store request nahi hai to order flow check hoga.
