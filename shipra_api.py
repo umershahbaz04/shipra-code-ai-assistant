@@ -345,6 +345,7 @@ class ShipraAPI:
         to_date: date | None,
         carrier_tracking_status_ids: str | None = None,
         payment_status_id: int | None = None,
+        validate_overall_total: bool = True,
     ) -> tuple[
         dict[str, Any],
         dict[str, str],
@@ -415,7 +416,7 @@ class ShipraAPI:
             reverse=True,
         )
 
-        if grouped_total != overall_total:
+        if validate_overall_total and grouped_total != overall_total:
             raise ShipraAPIError(
                 "Store-wise order total does not "
                 "match the overall filtered total. "
