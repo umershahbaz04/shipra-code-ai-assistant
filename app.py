@@ -1,9 +1,10 @@
 import re
+import time
 from pathlib import Path
 
 import streamlit as st
 import streamlit.components.v1 as components
-from groq import Groq
+from groq import Groq, RateLimitError
 from rag_engine import ShipraRag
 from intent_parser import OrderIntent, parse_order_intent, resolve_clarification_reply, resolve_date_range
 from live_api_executor import execute_live_intent
@@ -65,8 +66,17 @@ def response_language(question: str) -> str:
     return "English"
 
 def answer(question, history):
-    evidence = load_engine().retrieve(question)
-    context = ShipraRag.context(evidence)
+    evidence = load_engine().retrieve(question, limit=5)
+    context_blocks = []
+    for number, item in enumerate(evidence, 1):
+        meta = item.meta
+        context_blocks.append(
+            f"[S{number}] FILE: {meta.get('file_path')}\n"
+            f"LINES: {meta.get('start_line')}-{meta.get('end_line')}\n"
+            f"SYMBOL: {meta.get('symbol')}\n"
+            f"CODE:\n{item.text[:1800]}"
+        )
+    context = "\n\n".join(context_blocks)[:11000]
     language = response_language(question)
     prompt = f'''You are Shipra Code Assistant.
 Your required response language is: {language}.
@@ -81,12 +91,30 @@ Keep the answer concise. Do not add a "Verified sources", "Sources", or referenc
 QUESTION: {question}
 
 SOURCES:\n{context}'''
-    client = Groq(api_key=st.secrets["GROQ_API_KEY"], timeout=25, max_retries=1)
-    result = client.chat.completions.create(
-        model="openai/gpt-oss-20b",
-        messages=[{"role":"system", "content":"Follow the required response language exactly. Never output Devanagari/Hindi script."}, {"role":"user", "content":prompt}],
-        temperature=0.1,
-    )
+    client = Groq(api_key=st.secrets["GROQ_API_KEY"], timeout=25, max_retries=0)
+
+    def create_completion():
+        return client.chat.completions.create(
+            model="openai/gpt-oss-20b",
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "Follow the required response language exactly. "
+                        "Never output Devanagari/Hindi script."
+                    ),
+                },
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.1,
+            max_tokens=700,
+        )
+
+    try:
+        result = create_completion()
+    except RateLimitError:
+        time.sleep(4)
+        result = create_completion()
     text = result.choices[0].message.content or "Is indexed source snapshot mein jawab generate nahi hua."
 
     # The model may still produce a references heading despite the prompt. Remove it
