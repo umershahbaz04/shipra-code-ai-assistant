@@ -629,3 +629,4 @@ if q := st.chat_input("Ask about Shipra code..."):
                 )
         st.markdown(out)
     st.session_state.history.append({"role":"assistant","content":out})
+    st.rerun()
