@@ -216,6 +216,38 @@ def structured_store_answer(question: str) -> str | None:
             store_label = "store" if count == 1 else "stores"
             return f"According to the live Shipra API, there are **{count} {store_label}** in Shipra."
 
+        selected_store, updated_auth = _resolve_store(api, question)
+        st.session_state.shipra_auth = updated_auth
+
+        if selected_store:
+            stores, updated_auth = api.list_all_stores()
+            st.session_state.shipra_auth = updated_auth
+            store = next(
+                (
+                    row for row in stores
+                    if int(row.get("StoreId") or row.get("storeId") or 0)
+                    == selected_store["id"]
+                ),
+                {},
+            )
+            details = {
+                "Store name": store.get("StoreName") or store.get("storeName"),
+                "Store code": store.get("StoreCode") or store.get("storeCode"),
+                "Company": store.get("StoreCompany") or store.get("storeCompany"),
+                "Active": store.get("Active") if "Active" in store else store.get("active"),
+                "Connected channels": (
+                    store.get("SaleChannelConfigCount")
+                    or store.get("saleChannelConfigCount")
+                ),
+            }
+            lines = [f"**{selected_store['name']}** store ki verified information:"]
+            lines.extend(
+                f"- {key}: {value}"
+                for key, value in details.items()
+                if value is not None
+            )
+            return "\n".join(lines)
+
         stores, updated_auth = api.list_all_stores()
 
         st.session_state.shipra_auth = updated_auth
@@ -274,6 +306,45 @@ def _resolve_store(api: ShipraAPI, question: str):
 
     _, store_id, store_name = max(matches)
     return {"id": store_id, "name": store_name}, updated_auth
+
+
+def _resolve_sale_channel(api: ShipraAPI, question: str):
+    lookups, updated_auth = api.list_sale_channel_lookups()
+    question_text = f" {_normalize_store_text(question)} "
+    matches = []
+
+    for lookup in lookups:
+        lookup_id = (
+            lookup.get("SaleChannelLookupId")
+            or lookup.get("saleChannelLookupId")
+            or lookup.get("id")
+        )
+        lookup_name = (
+            lookup.get("SaleChannelName")
+            or lookup.get("saleChannelName")
+            or lookup.get("text")
+            or lookup.get("name")
+        )
+        normalized_name = _normalize_store_text(str(lookup_name or ""))
+
+        if lookup_id is not None and normalized_name and f" {normalized_name} " in question_text:
+            matches.append((len(normalized_name), int(lookup_id), str(lookup_name)))
+
+    if not matches:
+        return None, updated_auth
+
+    _, lookup_id, lookup_name = max(matches)
+    configs, updated_auth = api.list_sale_channels(lookup_id)
+    config_ids = [
+        int(row.get("id") or row.get("Id"))
+        for row in configs
+        if row.get("id") or row.get("Id")
+    ]
+
+    return {
+        "ids": config_ids,
+        "name": lookup_name,
+    }, updated_auth
 
 def _status_label(status: str, payment_status: str, count=None) -> str:
     singular = count == 1
@@ -413,12 +484,16 @@ def structured_live_answer(question: str, history) -> str | None:
     page_state = st.session_state.get("order_page")
     selected_store_id = None
     selected_store_name = None
+    selected_channel_ids = None
+    selected_channel_name = None
 
     if text in next_words | previous_words and page_state:
         intent = page_state["intent"]
         page = int(page_state["page"])
         selected_store_id = page_state.get("store_id")
         selected_store_name = page_state.get("store_name")
+        selected_channel_ids = page_state.get("channel_ids")
+        selected_channel_name = page_state.get("channel_name")
         page += 1 if text in next_words else -1
         page = max(page, 0)
     else:
@@ -468,12 +543,28 @@ def structured_live_answer(question: str, history) -> str | None:
             if selected_store:
                 selected_store_id = selected_store["id"]
                 selected_store_name = selected_store["name"]
-            elif store_order_question:
-                aggregate_words = r"\b(by store|store wise|store-wise|each store|every store|har store|kis store)\b"
-                if not re.search(aggregate_words, text):
-                    return "Store name match nahi hua. Exact store name ke sath dobara poochein."
+            else:
+                selected_channel, updated_auth = _resolve_sale_channel(api, store_question)
+                st.session_state.shipra_auth = updated_auth
 
-        if intent.group_by == "store" and selected_store_id is None:
+                if selected_channel:
+                    selected_channel_ids = selected_channel["ids"]
+                    selected_channel_name = selected_channel["name"]
+                elif store_order_question:
+                    aggregate_words = r"\b(by store|store wise|store-wise|each store|every store|har store|kis store)\b"
+                    if not re.search(aggregate_words, text):
+                        return "Store ya sale channel name match nahi hua. Exact name ke sath dobara poochein."
+
+        if selected_channel_name and not selected_channel_ids:
+            if intent.operation == "list":
+                return f"{selected_channel_name} ke liye koi active connection ya matching order nahi mila."
+            return f"Live Shipra API ke mutabiq **{selected_channel_name} ke 0 orders** hain."
+
+        if (
+            intent.group_by == "store"
+            and selected_store_id is None
+            and selected_channel_name is None
+        ):
             data, updated_auth = (
                 api.count_orders_by_store(
                     from_date=from_date,
@@ -515,6 +606,11 @@ def structured_live_answer(question: str, history) -> str | None:
                 carrier_tracking_status_ids=STATUS_IDS[intent.status],
                 payment_status_id=PAYMENT_STATUS_IDS[intent.payment_status],
                 store_ids=(str(selected_store_id) if selected_store_id is not None else None),
+                sale_channel_config_ids=(
+                    ",".join(str(value) for value in selected_channel_ids)
+                    if selected_channel_ids
+                    else None
+                ),
             )
             st.session_state.shipra_auth = updated_auth
             _validated_live_result(data, intent)
@@ -530,10 +626,13 @@ def structured_live_answer(question: str, history) -> str | None:
                 "total_pages": total_pages,
                 "store_id": selected_store_id,
                 "store_name": selected_store_name,
+                "channel_ids": selected_channel_ids,
+                "channel_name": selected_channel_name,
             }
             label = _status_label(intent.status, intent.payment_status, total)
-            if selected_store_name:
-                label = f"{selected_store_name} {label}"
+            source_name = selected_store_name or selected_channel_name
+            if source_name:
+                label = f"{source_name} {label}"
             result = format_order_rows(
                 data,
                 limit=50,
@@ -544,7 +643,9 @@ def structured_live_answer(question: str, history) -> str | None:
             result += f"\n\nPage **{page + 1} of {total_pages}**. Use the buttons below."
             return result
 
-        if intent.operation == "count" and selected_store_id is not None:
+        if intent.operation == "count" and (
+            selected_store_id is not None or selected_channel_ids
+        ):
             data, updated_auth = api.list_orders(
                 from_date,
                 to_date,
@@ -552,19 +653,25 @@ def structured_live_answer(question: str, history) -> str | None:
                 start=0,
                 carrier_tracking_status_ids=STATUS_IDS[intent.status],
                 payment_status_id=PAYMENT_STATUS_IDS[intent.payment_status],
-                store_ids=str(selected_store_id),
+                store_ids=(str(selected_store_id) if selected_store_id is not None else None),
+                sale_channel_config_ids=(
+                    ",".join(str(value) for value in selected_channel_ids)
+                    if selected_channel_ids
+                    else None
+                ),
             )
             st.session_state.shipra_auth = updated_auth
             _validated_live_result(data, intent)
             count = int(data.get("count") or 0)
             label = _status_label(intent.status, intent.payment_status, count)
             scope = _date_scope(from_date, to_date, intent.language)
+            source_name = selected_store_name or selected_channel_name
 
             if intent.language == "Roman Urdu":
-                return f"Live Shipra API ke mutabiq {scope} **{selected_store_name} ke {count} {label}** hain."
+                return f"Live Shipra API ke mutabiq {scope} **{source_name} ke {count} {label}** hain."
             if intent.language == "Arabic":
-                return f"وفقاً لواجهة Shipra المباشرة، لدى متجر {selected_store_name} **{count}** طلب خلال {scope}."
-            return f"According to the live Shipra API, **{selected_store_name} has {count} {label}** {scope}."
+                return f"وفقاً لواجهة Shipra المباشرة، لدى {source_name} **{count}** طلب خلال {scope}."
+            return f"According to the live Shipra API, **{source_name} has {count} {label}** {scope}."
 
         fetch_limit = 1000 if intent.status == "in_progress" else 1
         data, updated_auth = api.search_orders(
