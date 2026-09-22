@@ -2,6 +2,7 @@ import re
 from pathlib import Path
 
 import streamlit as st
+import streamlit.components.v1 as components
 from groq import Groq
 from rag_engine import ShipraRag
 from intent_parser import OrderIntent, parse_order_intent, resolve_clarification_reply, resolve_date_range
@@ -830,6 +831,7 @@ if page_state:
             st.session_state.history.append(
                 {"role": "assistant", "content": response}
             )
+            st.session_state.scroll_to_latest = True
             st.rerun()
 
     with page_column:
@@ -852,7 +854,40 @@ if page_state:
             st.session_state.history.append(
                 {"role": "assistant", "content": response}
             )
+            st.session_state.scroll_to_latest = True
             st.rerun()
+
+if st.session_state.pop("scroll_to_latest", False):
+    components.html(
+        """
+        <script>
+        setTimeout(() => {
+            window.frameElement.scrollIntoView({
+                behavior: 'smooth',
+                block: 'end'
+            });
+
+            const doc = window.parent.document;
+            const container =
+                doc.querySelector('[data-testid="stMain"]') ||
+                doc.querySelector('section.main');
+
+            if (container) {
+                container.scrollTo({
+                    top: container.scrollHeight,
+                    behavior: 'smooth'
+                });
+            } else {
+                window.parent.scrollTo({
+                    top: doc.body.scrollHeight,
+                    behavior: 'smooth'
+                });
+            }
+        }, 200);
+        </script>
+        """,
+        height=0,
+    )
 
 if q := st.chat_input("Ask about Shipra code..."):
     navigation_words = {
@@ -904,4 +939,5 @@ if q := st.chat_input("Ask about Shipra code..."):
                 )
         st.markdown(out)
     st.session_state.history.append({"role":"assistant","content":out})
+    st.session_state.scroll_to_latest = True
     st.rerun()
