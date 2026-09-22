@@ -360,6 +360,8 @@ def structured_live_answer(question: str, history) -> str | None:
     else:
         page = 0
         intent = None
+        if text not in next_words | previous_words:
+            st.session_state.pop("order_page", None)
 
     pending_intent = st.session_state.get("pending_order_intent")
     if intent is None:
@@ -436,10 +438,14 @@ def structured_live_answer(question: str, history) -> str | None:
             if page >= total_pages:
                 return "No more orders. Type `previous` to go back."
 
-            st.session_state.order_page = {"intent": intent, "page": page}
+            st.session_state.order_page = {
+                "intent": intent,
+                "page": page,
+                "total_pages": total_pages,
+            }
             label = _status_label(intent.status, intent.payment_status, total)
             result = format_order_rows(data, limit=50, language=intent.language, label=label)
-            result += f"\n\nPage **{page + 1} of {total_pages}**. Type `next` or `previous`."
+            result += f"\n\nPage **{page + 1} of {total_pages}**. Use the buttons below."
             return result
 
         fetch_limit = 1000 if intent.status == "in_progress" else 1
@@ -543,6 +549,50 @@ with st.sidebar:
 
 for msg in st.session_state.history:
     with st.chat_message(msg["role"]): st.markdown(msg["content"])
+
+page_state = st.session_state.get("order_page")
+if page_state:
+    current_page = int(page_state.get("page", 0))
+    total_pages = int(page_state.get("total_pages", 1))
+    previous_column, page_column, next_column = st.columns([1, 2, 1])
+
+    with previous_column:
+        if st.button(
+            "← Previous",
+            disabled=current_page <= 0,
+            use_container_width=True,
+        ):
+            response = structured_live_answer(
+                "previous",
+                st.session_state.history,
+            )
+            st.session_state.history.append(
+                {"role": "assistant", "content": response}
+            )
+            st.rerun()
+
+    with page_column:
+        st.markdown(
+            f"<p style='text-align:center'>Page "
+            f"<b>{current_page + 1}</b> of <b>{total_pages}</b></p>",
+            unsafe_allow_html=True,
+        )
+
+    with next_column:
+        if st.button(
+            "Next →",
+            disabled=current_page + 1 >= total_pages,
+            use_container_width=True,
+        ):
+            response = structured_live_answer(
+                "next",
+                st.session_state.history,
+            )
+            st.session_state.history.append(
+                {"role": "assistant", "content": response}
+            )
+            st.rerun()
+
 if q := st.chat_input("Ask about Shipra code..."):
     st.session_state.history.append({"role":"user","content":q})
     with st.chat_message("user"): st.markdown(q)
