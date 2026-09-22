@@ -441,15 +441,16 @@ class ShipraAPI:
         *,
         carrier_tracking_status_ids: str | None = None,
         payment_status_id: int | None = None,
-        fetch_limit: int = None,
+        fetch_limit: int = 1,
     ) -> tuple[dict[str, Any], dict[str, str]]:
         """Return one consistently filtered count/list result, paging when requested."""
 
+        fetch_limit = max(int(fetch_limit), 1)
         page_size = min(fetch_limit, 100)
         rows: list[dict[str, Any]] = []
         total: int | float | None = None
         start = 0
-        while total is None or len(rows) < total:
+        while len(rows) < fetch_limit:
             page, _ = self.list_orders(
                 from_date,
                 to_date,
@@ -572,10 +573,10 @@ def format_order_rows(data: dict[str, Any], limit: int = 10, language: str = "En
     if language == "Arabic":
         lines = [f"أعادت واجهة Shipra المباشرة **{total}** من {label}. يتم عرض {min(len(rows), limit)}:"]
     elif language == "Roman Urdu":
-        lines = [f"Live Shipra API ne **{total} {label}** return kiye. {len(rows)} dikhaye ja rahe hain:"]
+        lines = [f"Live Shipra API ne **{total} {label}** return kiye. {min(len(rows), limit)} dikhaye ja rahe hain:"]
     else:
-        lines = [f"Live Shipra API returned **{total} {label}**. Showing {len(rows)}:"]
-    for index, row in enumerate(rows, 1):
+        lines = [f"Live Shipra API returned **{total} {label}**. Showing {min(len(rows), limit)}:"]
+    for index, row in enumerate(rows[:limit], 1):
         selected = {key: row[key] for key in preferred if key in row and row[key] not in (None, "")}
         summary = ", ".join(f"{key}: {value}" for key, value in selected.items()) or "No safe summary fields returned"
         lines.append(f"{index}. {summary}")
