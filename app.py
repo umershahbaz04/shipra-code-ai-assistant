@@ -519,7 +519,10 @@ st.caption("Public guest mode • Chats are temporary and never shared")
 if "history" not in st.session_state: st.session_state.history = []
 with st.sidebar:
     if st.button("New chat", use_container_width=True):
-        st.session_state.history = []; st.rerun()
+        st.session_state.history = []
+        st.session_state.pop("order_page", None)
+        st.session_state.pop("pending_order_intent", None)
+        st.rerun()
     st.caption("Code answers use the indexed source snapshot.")
     st.divider()
     st.subheader("Connect Shipra")
