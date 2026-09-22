@@ -20,6 +20,7 @@ ALLOWED_DATE_MODES = {
 }
 ALLOWED_LANGUAGES = {"English", "Roman Urdu", "Arabic"}
 ALLOWED_PAYMENT_STATUSES = {"all", "unpaid", "paid"}
+ALLOWED_GROUPINGS = {"none", "store"}
 
 
 @dataclass(frozen=True)
@@ -37,6 +38,7 @@ class OrderIntent:
     clarification: str = ""
     order_reference: str | None = None
     payment_status: str = "all"
+    group_by: str = "none"
 
 
 def _json_object(text: str) -> dict[str, Any]:
@@ -71,6 +73,7 @@ def _validate(raw: dict[str, Any]) -> OrderIntent:
     clarification = str(raw.get("clarification") or "").strip()
     order_reference = str(raw.get("order_reference") or "").strip() or None
     payment_status = str(raw.get("payment_status") or "all").lower()
+    group_by = str(raw.get("group_by") or "none").lower()
 
     if operation not in ALLOWED_OPERATIONS:
         if needs_clarification:
@@ -94,6 +97,8 @@ def _validate(raw: dict[str, Any]) -> OrderIntent:
             payment_status = "all"
         else:
             raise ValueError("Unsupported payment status.")
+    if group_by not in ALLOWED_GROUPINGS:
+        raise ValueError("Unsupported order grouping.")
     if not 0 <= confidence <= 1:
         raise ValueError("Invalid confidence value.")
 
@@ -142,6 +147,7 @@ def _validate(raw: dict[str, Any]) -> OrderIntent:
         clarification=clarification,
         order_reference=order_reference,
         payment_status=payment_status,
+        group_by=group_by,
     )
 
 
@@ -170,7 +176,8 @@ Schema:
   "needs_clarification": boolean,
   "clarification": string,
   "order_reference": string|null,
-  "payment_status": "all"|"unpaid"|"paid"
+  "payment_status": "all"|"unpaid"|"paid",
+  "group_by": "none"|"store"
 }}
 
 Rules:
@@ -182,6 +189,8 @@ Rules:
 - Payment wording such as "payment pending", "not paid", "unpaid", or "has not paid yet"
   maps to payment_status=unpaid and status=all. It is never an in_progress tracking query.
 - "paid payment" maps to payment_status=paid.
+- Questions asking for orders/counts by store map to group_by=store.
+- For all other questions, group_by=none.
 - "last N days/weeks" means rolling N*1/N*7 days including today.
 - Bare durations such as "2 din k" or "1 week k" also mean rolling periods.
 - "previous month" means previous_calendar_month.
@@ -232,7 +241,10 @@ def resolve_clarification_reply(intent: OrderIntent, reply: str) -> OrderIntent 
     changed = False
 
     if intent.status == "in_progress" and intent.needs_clarification:
-        if text in {"progress", "in progress", "in-progress", "jo progress mai hain", "jo abi progress mai hain"}:
+        if text in {
+            "progress", "progree", "progres", "in progress", "in-progress",
+            "jo progress mai hain", "jo abi progress mai hain",
+        }:
             resolved = replace(resolved, status="in_progress")
             changed = True
         elif text in {"pending for return", "return pending", "pending return", "return"}:
