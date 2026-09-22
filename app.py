@@ -408,9 +408,8 @@ def structured_live_answer(question: str, history) -> str | None:
             if intent.language == "Arabic":
                 return f"وفقاً لواجهة Shipra المباشرة، العدد هو **{count}** خلال {scope}."
             return f"According to the live Shipra API, there are **{count} {label}** {scope}."
-        result = format_order_rows(data, limit=50, language=intent.language, label=label)
-        if not data.get("complete"):
-            result += "\n\nOnly the first 50 matching orders are shown; the total count above is from the filtered Shipra API."
+        result = format_order_rows(data, limit=None, language=intent.language, label=label)
+        
         return result
     except (ShipraAPIError, ValueError) as exc:
         return f"Shipra live-data request stopped safely: `{exc}`"
