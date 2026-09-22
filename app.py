@@ -469,6 +469,28 @@ def _validated_live_result(data, intent: OrderIntent):
             if name and name != intent.payment_status:
                 raise ShipraAPIError("Shipra returned a row outside the requested payment-status filter.")
 
+
+def _validate_order_source(data, store_id=None, channel_ids=None):
+    allowed_channels = {int(value) for value in (channel_ids or [])}
+
+    for row in data.get("rows") or []:
+        if store_id is not None:
+            raw_store_id = row.get("StoreId", row.get("storeId"))
+            if raw_store_id is None or int(raw_store_id) != int(store_id):
+                raise ShipraAPIError(
+                    "Shipra returned an order outside the selected store. Result blocked."
+                )
+
+        if allowed_channels:
+            raw_channel_id = row.get(
+                "SaleChannelConfigId",
+                row.get("saleChannelConfigId"),
+            )
+            if raw_channel_id is None or int(raw_channel_id) not in allowed_channels:
+                raise ShipraAPIError(
+                    "Shipra returned an order outside the selected sale channel. Result blocked."
+                )
+
 def structured_live_answer(question: str, history) -> str | None:
     text = " ".join(question.lower().strip().split())
 
@@ -614,6 +636,11 @@ def structured_live_answer(question: str, history) -> str | None:
             )
             st.session_state.shipra_auth = updated_auth
             _validated_live_result(data, intent)
+            _validate_order_source(
+                data,
+                store_id=selected_store_id,
+                channel_ids=selected_channel_ids,
+            )
 
             total = int(data.get("count") or 0)
             total_pages = max((total + 49) // 50, 1)
@@ -662,6 +689,11 @@ def structured_live_answer(question: str, history) -> str | None:
             )
             st.session_state.shipra_auth = updated_auth
             _validated_live_result(data, intent)
+            _validate_order_source(
+                data,
+                store_id=selected_store_id,
+                channel_ids=selected_channel_ids,
+            )
             count = int(data.get("count") or 0)
             label = _status_label(intent.status, intent.payment_status, count)
             scope = _date_scope(from_date, to_date, intent.language)
