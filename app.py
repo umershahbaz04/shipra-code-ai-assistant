@@ -167,6 +167,37 @@ def structured_store_answer(question: str) -> str | None:
             auth=auth,
         )
 
+        if "shopify" in text:
+            channels, updated_auth = api.list_sale_channels(1)
+            st.session_state.shipra_auth = updated_auth
+            names = [
+                row.get("text")
+                or row.get("Text")
+                or row.get("SaleChannelName")
+                or row.get("saleChannelName")
+                for row in channels
+            ]
+            names = [name for name in names if name]
+
+            if not names:
+                if language == "Arabic":
+                    return "لا توجد قناة Shopify نشطة مرتبطة بحساب Shipra الحالي."
+                if language == "Roman Urdu":
+                    return "Current Shipra account ke sath koi active Shopify channel connected nahi hai."
+                return "There is no active Shopify channel connected to the current Shipra account."
+
+            if language == "Arabic":
+                heading = f"نعم، توجد **{len(names)} قناة Shopify نشطة**:"
+            elif language == "Roman Urdu":
+                heading = f"Ji haan, **{len(names)} active Shopify channels** connected hain:"
+            else:
+                label = "channel" if len(names) == 1 else "channels"
+                heading = f"Yes, **{len(names)} active Shopify {label}** are connected:"
+
+            return "\n".join(
+                [heading, *[f"{i}. {name}" for i, name in enumerate(names, 1)]]
+            )
+
         if has_count_word:
             count, updated_auth = api.count_stores()
 
@@ -597,6 +628,20 @@ if page_state:
             st.rerun()
 
 if q := st.chat_input("Ask about Shipra code..."):
+    navigation_words = {
+        "next",
+        "next page",
+        "agla",
+        "agla page",
+        "previous",
+        "previous page",
+        "back",
+        "pichla",
+        "pichla page",
+    }
+    if " ".join(q.lower().strip().split()) not in navigation_words:
+        st.session_state.pop("order_page", None)
+
     st.session_state.history.append({"role":"user","content":q})
     with st.chat_message("user"): st.markdown(q)
     with st.chat_message("assistant"):
