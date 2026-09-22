@@ -260,9 +260,12 @@ Rules:
 - "paid payment" maps to payment_status=paid.
 - Questions asking for a count breakdown/distribution by store (for example
   "kis store ke kitne orders" or "count by store") map to group_by=store.
-- Requests to show/list orders across all stores (for example "show all stores'
-  orders" or "sary stores k orders dikhao") use operation=list,
-  group_by=none, and status=all. They are not a specific-store request.
+- Requests to show/list orders separated or grouped by store (for example
+  "sary stores k orders alag alag dikhao", "group orders by store", or
+  "har store ke orders separate dikhao") use operation=list and group_by=store.
+- A plain request to show/list all orders across all stores, without words such
+  as separate, grouped, alag alag, store-wise, or each store, uses
+  operation=list and group_by=none.
 - For all other questions, group_by=none.
 - "last N days/weeks" means rolling N*1/N*7 days including today.
 - Bare durations such as "2 din k" or "1 week k" also mean rolling periods.
