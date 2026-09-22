@@ -385,7 +385,7 @@ def structured_live_answer(question: str, history) -> str | None:
         if intent.operation == "count" and intent.status == "in_progress":
             fetch_limit = 1000
         else:
-            fetch_limit = 1 if intent.operation == "count" else 50
+            fetch_limit = None
         data, updated_auth = api.search_orders(
             from_date,
             to_date,
