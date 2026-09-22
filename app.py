@@ -1,12 +1,23 @@
 import re
 import time
+from difflib import SequenceMatcher
 from pathlib import Path
 
 import streamlit as st
 import streamlit.components.v1 as components
 from groq import Groq, RateLimitError
 from rag_engine import ShipraRag
-from intent_parser import OrderIntent, parse_order_intent, resolve_clarification_reply, resolve_date_range
+from intent_parser import (
+    OrderIntent,
+    parse_order_intent,
+    resolve_clarification_reply,
+    resolve_date_range,
+)
+
+try:
+    from intent_parser import parse_request_route
+except ImportError:
+    parse_request_route = None
 from live_api_executor import execute_live_intent
 from live_api_intent import parse_live_api_intent
 from live_response_formatter import format_live_result
@@ -66,7 +77,7 @@ def response_language(question: str) -> str:
     return "English"
 
 def answer(question, history):
-    evidence = load_engine().retrieve(question, limit=5)
+    evidence = load_engine().retrieve(question, limit=8)
     context_blocks = []
     for number, item in enumerate(evidence, 1):
         meta = item.meta
@@ -74,7 +85,7 @@ def answer(question, history):
             f"[S{number}] FILE: {meta.get('file_path')}\n"
             f"LINES: {meta.get('start_line')}-{meta.get('end_line')}\n"
             f"SYMBOL: {meta.get('symbol')}\n"
-            f"CODE:\n{item.text[:1800]}"
+            f"CODE:\n{item.text[:1400]}"
         )
     context = "\n\n".join(context_blocks)[:11000]
     language = response_language(question)
@@ -86,6 +97,13 @@ Every factual statement must end in one or more citations like [S1].
 If the source does not prove the answer, clearly say it is not verified by the indexed source snapshot, in the required response language. Do not guess.
 For a short list question, answer directly; do not add scenario steps.
 For a code-change question, separate verified existing code from proposed code and label every proposed file/path as an assumption.
+For workflow, implementation, or "how" questions, give a numbered step-by-step guide. For every step, name the exact verified file and function/symbol, explain what happens next, and include a short exact code excerpt copied only from the supplied source. Put the code excerpt immediately below its step.
+Never reconstruct, complete, improve, or paraphrase code inside a code block. If the exact required lines are not present in the supplied sources, state that the code excerpt is not verified instead of inventing it.
+When multiple files implement similar flows, keep their behavior separate by filename and function. Do not merge branch-specific loading, notification, badge, navigation, API, or error behavior into a generic claim.
+Trace a frontend API call into its verified backend controller/command/handler before describing the backend flow. If that connection is not present in the supplied sources, clearly state the evidence gap.
+Distinguish between creating or updating a record and implementing its dashboard/section. If the question is genuinely ambiguous and the two answers would differ materially, ask one concise clarification question.
+For a requested change, first show the verified existing code, then provide the proposed replacement under a clear "Proposed change" label. Never present proposed code as code already present in Shipra.
+Keep each excerpt focused: normally 3-12 lines. Cite the explanation and its excerpt with the matching source marker.
 Keep the answer concise. Do not add a "Verified sources", "Sources", or references section. The application renders only the source paths that your answer actually cites.
 
 QUESTION: {question}
@@ -107,7 +125,7 @@ SOURCES:\n{context}'''
                 {"role": "user", "content": prompt},
             ],
             temperature=0.1,
-            max_tokens=700,
+            max_tokens=1100,
         )
 
     try:
@@ -320,7 +338,9 @@ def _normalize_store_text(value: str) -> str:
 def _resolve_store(api: ShipraAPI, question: str):
     stores, updated_auth = api.list_all_stores()
     question_text = f" {_normalize_store_text(question)} "
-    matches = []
+    exact_matches = []
+    fuzzy_matches = []
+    question_words = question_text.split()
 
     for store in stores:
         store_id = store.get("StoreId") or store.get("storeId")
@@ -328,12 +348,43 @@ def _resolve_store(api: ShipraAPI, question: str):
         normalized_name = _normalize_store_text(str(store_name or ""))
 
         if store_id is not None and normalized_name and f" {normalized_name} " in question_text:
-            matches.append((len(normalized_name), int(store_id), str(store_name)))
+            exact_matches.append((len(normalized_name), int(store_id), str(store_name)))
+            continue
 
-    if not matches:
+        if store_id is None or len(normalized_name) < 4:
+            continue
+
+        name_word_count = len(normalized_name.split())
+        windows = [
+            " ".join(question_words[index:index + name_word_count])
+            for index in range(len(question_words) - name_word_count + 1)
+        ]
+        if name_word_count == 1:
+            generic_words = {
+                "store", "stores", "shop", "orders", "order",
+                "sale", "sales", "channel",
+            }
+            windows = [window for window in windows if window not in generic_words]
+        score = max(
+            (SequenceMatcher(None, normalized_name, window).ratio() for window in windows),
+            default=0.0,
+        )
+        if score >= 0.90:
+            fuzzy_matches.append((score, int(store_id), str(store_name)))
+
+    if exact_matches:
+        _, store_id, store_name = max(exact_matches)
+        return {"id": store_id, "name": store_name}, updated_auth
+
+    fuzzy_matches.sort(reverse=True)
+    if not fuzzy_matches:
         return None, updated_auth
 
-    _, store_id, store_name = max(matches)
+    # Similar store names ko guess karne ke bajaye ambiguous result block hoga.
+    if len(fuzzy_matches) > 1 and fuzzy_matches[0][0] - fuzzy_matches[1][0] < 0.04:
+        return None, updated_auth
+
+    _, store_id, store_name = fuzzy_matches[0]
     return {"id": store_id, "name": store_name}, updated_auth
 
 
@@ -937,29 +988,59 @@ if q := st.chat_input("Ask about Shipra code..."):
     with st.chat_message("assistant"):
         with st.spinner("Searching verified source..."):
             try:
-                # Pehle live store request check hogi.
-                out = structured_store_answer(q)
+                pending = st.session_state.get("pending_order_intent")
+                is_navigation = " ".join(q.lower().strip().split()) in navigation_words
 
-                # Agar store request nahi hai to order flow check hoga.
-                if out is None:
-                    out = structured_live_answer(
-                        q,
-                        st.session_state.history,
+                # Clarification aur page navigation ko existing order state handle karegi.
+                if pending or is_navigation:
+                    out = structured_live_answer(q, st.session_state.history)
+                else:
+                    try:
+                        request_route = parse_request_route(
+                            st.secrets["GROQ_API_KEY"],
+                            q,
+                        )
+                    except Exception:
+                        request_route = None
+
+                    routed_q = (
+                        request_route.normalized_question
+                        if request_route and request_route.confidence >= 0.75
+                        else q
+                    )
+                    route = (
+                        request_route.route
+                        if request_route and request_route.confidence >= 0.75
+                        else None
                     )
 
-                # Non-order verified live APIs check hongi.
-                if out is None:
-                    out = structured_universal_live_answer(
-                        q,
-                        st.session_state.history,
-                    )
+                    if route == "order_live":
+                        out = structured_live_answer(
+                            routed_q,
+                            st.session_state.history,
+                        )
+                    elif route == "store_live":
+                        out = structured_store_answer(routed_q)
+                    elif route == "other_live":
+                        out = structured_universal_live_answer(
+                            routed_q,
+                            st.session_state.history,
+                        )
+                    elif route == "rag":
+                        out = answer(q, st.session_state.history[-8:])
+                    else:
+                        # Router unavailable ho to purana safe flow fallback rahega.
+                        out = structured_store_answer(q)
+                        if out is None:
+                            out = structured_live_answer(q, st.session_state.history)
+                        if out is None:
+                            out = structured_universal_live_answer(
+                                q,
+                                st.session_state.history,
+                            )
 
-                # Agar live-data request nahi hai to RAG source search hogi.
-                if out is None:
-                    out = answer(
-                        q,
-                        st.session_state.history[-8:],
-                    )
+                    if out is None:
+                        out = answer(q, st.session_state.history[-8:])
             except Exception as exc:
                 out = (
                     f"Source search failed safely: "
