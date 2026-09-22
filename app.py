@@ -145,6 +145,10 @@ def structured_store_answer(question: str) -> str | None:
     if not has_store_word:
         return None
 
+    # Store ke orders wala sawal order flow handle karega.
+    if re.search(r"\b(order|orders|parcel|shipment)\b|آرڈر|طلب", text):
+        return None
+
     language = response_language(question)
     auth = st.session_state.get("shipra_auth")
 
@@ -245,6 +249,31 @@ def _clarification_message(intent: OrderIntent) -> str:
     if intent.language == "Roman Urdu":
         return "Order status aur date range clear karein taa-ke exact result diya ja sake."
     return "Please clarify the order status and date range so I can return an exact result."
+
+
+def _normalize_store_text(value: str) -> str:
+    value = re.sub(r"\(\s*default\s*\)", "", value, flags=re.IGNORECASE)
+    return " ".join(re.sub(r"[^a-z0-9]+", " ", value.lower()).split())
+
+
+def _resolve_store(api: ShipraAPI, question: str):
+    stores, updated_auth = api.list_all_stores()
+    question_text = f" {_normalize_store_text(question)} "
+    matches = []
+
+    for store in stores:
+        store_id = store.get("StoreId") or store.get("storeId")
+        store_name = store.get("StoreName") or store.get("storeName")
+        normalized_name = _normalize_store_text(str(store_name or ""))
+
+        if store_id is not None and normalized_name and f" {normalized_name} " in question_text:
+            matches.append((len(normalized_name), int(store_id), str(store_name)))
+
+    if not matches:
+        return None, updated_auth
+
+    _, store_id, store_name = max(matches)
+    return {"id": store_id, "name": store_name}, updated_auth
 
 def _status_label(status: str, payment_status: str, count=None) -> str:
     singular = count == 1
@@ -382,10 +411,14 @@ def structured_live_answer(question: str, history) -> str | None:
     next_words = {"next", "next page", "agla", "agla page", "اگلا"}
     previous_words = {"previous", "previous page", "back", "pichla", "pichla page", "پچھلا"}
     page_state = st.session_state.get("order_page")
+    selected_store_id = None
+    selected_store_name = None
 
     if text in next_words | previous_words and page_state:
         intent = page_state["intent"]
         page = int(page_state["page"])
+        selected_store_id = page_state.get("store_id")
+        selected_store_name = page_state.get("store_name")
         page += 1 if text in next_words else -1
         page = max(page, 0)
     else:
@@ -407,11 +440,14 @@ def structured_live_answer(question: str, history) -> str | None:
             return None
     if not intent.is_order_query:
         st.session_state.pop("pending_order_intent", None)
+        st.session_state.pop("pending_order_question", None)
         return None
     if intent.needs_clarification:
         st.session_state.pending_order_intent = intent
+        st.session_state.pending_order_question = question
         return _clarification_message(intent)
     st.session_state.pop("pending_order_intent", None)
+    store_question = st.session_state.pop("pending_order_question", None) or question
 
     auth = st.session_state.get("shipra_auth")
     if not auth:
@@ -419,7 +455,25 @@ def structured_live_answer(question: str, history) -> str | None:
     try:
         from_date, to_date = resolve_date_range(intent)
         api = ShipraAPI(shipra_base_url(), auth=auth)
-        if intent.group_by == "store":
+
+        store_order_question = bool(
+            re.search(r"\b(store|stores|stor)\b|سٹور|متجر|متاجر", store_question, re.IGNORECASE)
+            and re.search(r"\b(order|orders|parcel|shipment)\b|آرڈر|طلب", store_question, re.IGNORECASE)
+        )
+
+        if selected_store_id is None and text not in next_words | previous_words:
+            selected_store, updated_auth = _resolve_store(api, store_question)
+            st.session_state.shipra_auth = updated_auth
+
+            if selected_store:
+                selected_store_id = selected_store["id"]
+                selected_store_name = selected_store["name"]
+            elif store_order_question:
+                aggregate_words = r"\b(by store|store wise|store-wise|each store|every store|har store|kis store)\b"
+                if not re.search(aggregate_words, text):
+                    return "Store name match nahi hua. Exact store name ke sath dobara poochein."
+
+        if intent.group_by == "store" and selected_store_id is None:
             data, updated_auth = (
                 api.count_orders_by_store(
                     from_date=from_date,
@@ -460,6 +514,7 @@ def structured_live_answer(question: str, history) -> str | None:
                 start=page * 50,
                 carrier_tracking_status_ids=STATUS_IDS[intent.status],
                 payment_status_id=PAYMENT_STATUS_IDS[intent.payment_status],
+                store_ids=(str(selected_store_id) if selected_store_id is not None else None),
             )
             st.session_state.shipra_auth = updated_auth
             _validated_live_result(data, intent)
@@ -473,8 +528,12 @@ def structured_live_answer(question: str, history) -> str | None:
                 "intent": intent,
                 "page": page,
                 "total_pages": total_pages,
+                "store_id": selected_store_id,
+                "store_name": selected_store_name,
             }
             label = _status_label(intent.status, intent.payment_status, total)
+            if selected_store_name:
+                label = f"{selected_store_name} {label}"
             result = format_order_rows(
                 data,
                 limit=50,
@@ -484,6 +543,28 @@ def structured_live_answer(question: str, history) -> str | None:
             )
             result += f"\n\nPage **{page + 1} of {total_pages}**. Use the buttons below."
             return result
+
+        if intent.operation == "count" and selected_store_id is not None:
+            data, updated_auth = api.list_orders(
+                from_date,
+                to_date,
+                limit=1,
+                start=0,
+                carrier_tracking_status_ids=STATUS_IDS[intent.status],
+                payment_status_id=PAYMENT_STATUS_IDS[intent.payment_status],
+                store_ids=str(selected_store_id),
+            )
+            st.session_state.shipra_auth = updated_auth
+            _validated_live_result(data, intent)
+            count = int(data.get("count") or 0)
+            label = _status_label(intent.status, intent.payment_status, count)
+            scope = _date_scope(from_date, to_date, intent.language)
+
+            if intent.language == "Roman Urdu":
+                return f"Live Shipra API ke mutabiq {scope} **{selected_store_name} ke {count} {label}** hain."
+            if intent.language == "Arabic":
+                return f"وفقاً لواجهة Shipra المباشرة، لدى متجر {selected_store_name} **{count}** طلب خلال {scope}."
+            return f"According to the live Shipra API, **{selected_store_name} has {count} {label}** {scope}."
 
         fetch_limit = 1000 if intent.status == "in_progress" else 1
         data, updated_auth = api.search_orders(
@@ -559,6 +640,7 @@ with st.sidebar:
         st.session_state.history = []
         st.session_state.pop("order_page", None)
         st.session_state.pop("pending_order_intent", None)
+        st.session_state.pop("pending_order_question", None)
         st.rerun()
     st.caption("Code answers use the indexed source snapshot.")
     st.divider()
