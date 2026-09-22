@@ -475,7 +475,13 @@ def structured_live_answer(question: str, history) -> str | None:
                 "total_pages": total_pages,
             }
             label = _status_label(intent.status, intent.payment_status, total)
-            result = format_order_rows(data, limit=50, language=intent.language, label=label)
+            result = format_order_rows(
+                data,
+                limit=50,
+                language=intent.language,
+                label=label,
+                start_index=(page * 50) + 1,
+            )
             result += f"\n\nPage **{page + 1} of {total_pages}**. Use the buttons below."
             return result
 
