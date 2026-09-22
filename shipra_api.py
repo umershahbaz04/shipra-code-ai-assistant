@@ -179,18 +179,248 @@ class ShipraAPI:
             raise ShipraAPIError(_error_message(payload, f"Shipra API request failed ({response.status_code})."))
         return payload
 
-    def count_orders(self, kind: str, from_date: date | None, to_date: date | None) -> tuple[int | float, dict[str, str]]:
+    def count_orders(
+        self,
+        kind: str,
+        from_date: date | None,
+        to_date: date | None,
+    ) -> tuple[int | float, dict[str, str]]:
         route = self.COUNT_ROUTES[kind]
-        body = {"filterModel": {
-            "createdFrom": from_date.isoformat() if from_date else None,
-            "createdTo": to_date.isoformat() if to_date else None,
-        }}
-        payload = self._request("POST", route, json_body=body)
+
+        body = {
+            "filterModel": {
+                "createdFrom": (
+                    from_date.isoformat()
+                    if from_date
+                    else None
+                ),
+                "createdTo": (
+                    to_date.isoformat()
+                    if to_date
+                    else None
+                ),
+            }
+        }
+
+        payload = self._request(
+            "POST",
+            route,
+            json_body=body,
+        )
+
         count = _find_count(payload)
+
         if count is None:
-            raise ShipraAPIError("The count API returned no recognizable count field.")
+            raise ShipraAPIError(
+                "The count API returned no recognizable count field."
+            )
+
         return count, self.auth.as_dict()
 
+    def count_stores(
+        self,
+    ) -> tuple[int, dict[str, str]]:
+        body = {
+            "filterModel": {
+                "createdFrom": None,
+                "createdTo": None,
+                "start": 0,
+                "length": 1,
+                "search": "",
+                "sortCol": 0,
+                "sortDir": "desc",
+            }
+        }
+
+        payload = self._request(
+            "POST",
+            "Store/GetAllStores",
+            json_body=body,
+        )
+
+        count = _find_count(payload)
+
+        if count is None:
+            raise ShipraAPIError(
+                "Store API returned no recognizable TotalCount."
+            )
+
+        return int(count), self.auth.as_dict()
+    
+    def list_all_stores(
+        self,
+    ) -> tuple[
+        list[dict[str, Any]],
+        dict[str, str],
+    ]:
+        stores: list[dict[str, Any]] = []
+        seen_store_ids: set[int] = set()
+        start = 0
+        page_size = 100
+        total_count: int | None = None
+
+        while total_count is None or start < total_count:
+            body = {
+                "filterModel": {
+                    "createdFrom": None,
+                    "createdTo": None,
+                    "start": start,
+                    "length": page_size,
+                    "search": "",
+                    "sortCol": 0,
+                    "sortDir": "desc",
+                }
+            }
+
+            payload = self._request(
+                "POST",
+                "Store/GetAllStores",
+                json_body=body,
+            )
+
+            rows = _find_rows(payload)
+            found_count = _find_count(payload)
+
+            if total_count is None:
+                total_count = int(
+                    found_count
+                    if found_count is not None
+                    else len(rows)
+                )
+
+            for store in rows:
+                store_id = (
+                    store.get("StoreId")
+                    or store.get("storeId")
+                )
+
+                if store_id is None:
+                    continue
+
+                store_id = int(store_id)
+
+                if store_id in seen_store_ids:
+                    continue
+
+                seen_store_ids.add(store_id)
+                stores.append(store)
+
+            if not rows:
+                break
+
+            start += len(rows)
+
+        return stores, self.auth.as_dict()
+
+    def list_sale_channels(
+        self,
+        lookup_id: int,
+    ) -> tuple[list[dict[str, Any]], dict[str, str]]:
+        payload = self._request(
+            "GET",
+            "SaleChannel/GetAllSaleChannelByLookupIdForSelection"
+            f"?saleChannelLookupId={lookup_id}",
+        )
+
+        rows = [
+            row
+            for row in _find_rows(payload)
+            if int(row.get("id") or row.get("Id") or 0) > 0
+        ]
+
+        return rows, self.auth.as_dict()
+
+    def count_orders_by_store(
+        self,
+        from_date: date | None,
+        to_date: date | None,
+        carrier_tracking_status_ids: str | None = None,
+        payment_status_id: int | None = None,
+    ) -> tuple[
+        dict[str, Any],
+        dict[str, str],
+    ]:
+        overall_data, _ = self.list_orders(
+            from_date=from_date,
+            to_date=to_date,
+            limit=1,
+            start=0,
+            carrier_tracking_status_ids=(
+                carrier_tracking_status_ids
+            ),
+            payment_status_id=payment_status_id,
+        )
+
+        overall_total = int(
+            overall_data.get("count") or 0
+        )
+
+        stores, _ = self.list_all_stores()
+
+        store_counts: list[dict[str, Any]] = []
+        grouped_total = 0
+
+        for store in stores:
+            store_id = (
+                store.get("StoreId")
+                or store.get("storeId")
+            )
+
+            store_name = (
+                store.get("StoreName")
+                or store.get("storeName")
+                or f"Store {store_id}"
+            )
+
+            if store_id is None:
+                continue
+
+            store_data, _ = self.list_orders(
+                from_date=from_date,
+                to_date=to_date,
+                limit=1,
+                start=0,
+                carrier_tracking_status_ids=(
+                    carrier_tracking_status_ids
+                ),
+                payment_status_id=payment_status_id,
+                store_ids=str(store_id),
+            )
+
+            order_count = int(
+                store_data.get("count") or 0
+            )
+
+            grouped_total += order_count
+
+            store_counts.append(
+                {
+                    "storeId": int(store_id),
+                    "storeName": str(store_name),
+                    "orderCount": order_count,
+                }
+            )
+
+        store_counts.sort(
+            key=lambda item: item["orderCount"],
+            reverse=True,
+        )
+
+        if grouped_total != overall_total:
+            raise ShipraAPIError(
+                "Store-wise order total does not "
+                "match the overall filtered total. "
+                "No result was shown."
+            )
+
+        result = {
+            "totalCount": overall_total,
+            "groupedTotal": grouped_total,
+            "stores": store_counts,
+        }
+
+        return result, self.auth.as_dict()
+    
     def list_orders(
         self,
         from_date: date | None,
@@ -200,6 +430,7 @@ class ShipraAPI:
         start: int = 0,
         carrier_tracking_status_ids: str | None = None,
         payment_status_id: int | None = None,
+        store_ids: str | None = None,        
     ) -> tuple[dict[str, Any], dict[str, str]]:
         body = {
             "filterModel": {
@@ -215,6 +446,7 @@ class ShipraAPI:
             "readyForAssignment": True,
             "carrierTrackingStatusIds": carrier_tracking_status_ids,
             "paymentStatusId": payment_status_id,
+            "storeIds": store_ids,            
             "orderAddressFilter": {},
         }
         payload = self._request("POST", "Order/GetAllOrders", json_body=body)
@@ -227,10 +459,11 @@ class ShipraAPI:
         *,
         carrier_tracking_status_ids: str | None = None,
         payment_status_id: int | None = None,
-        fetch_limit: int = 50,
+        fetch_limit: int = 1,
     ) -> tuple[dict[str, Any], dict[str, str]]:
         """Return one consistently filtered count/list result, paging when requested."""
-        fetch_limit = min(max(fetch_limit, 1), 1000)
+
+        fetch_limit = max(int(fetch_limit), 1)
         page_size = min(fetch_limit, 100)
         rows: list[dict[str, Any]] = []
         total: int | float | None = None
@@ -340,7 +573,13 @@ def filter_in_progress_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return filtered
 
 
-def format_order_rows(data: dict[str, Any], limit: int = 10, language: str = "English", label: str = "orders") -> str:
+def format_order_rows(
+    data: dict[str, Any],
+    limit: int = 10,
+    language: str = "English",
+    label: str = "orders",
+    start_index: int = 1,
+) -> str:
     rows = data.get("rows") or []
     count = data.get("count")
     if not rows:
@@ -361,7 +600,7 @@ def format_order_rows(data: dict[str, Any], limit: int = 10, language: str = "En
         lines = [f"Live Shipra API ne **{total} {label}** return kiye. {min(len(rows), limit)} dikhaye ja rahe hain:"]
     else:
         lines = [f"Live Shipra API returned **{total} {label}**. Showing {min(len(rows), limit)}:"]
-    for index, row in enumerate(rows[:limit], 1):
+    for index, row in enumerate(rows[:limit], start_index):
         selected = {key: row[key] for key in preferred if key in row and row[key] not in (None, "")}
         summary = ", ".join(f"{key}: {value}" for key, value in selected.items()) or "No safe summary fields returned"
         lines.append(f"{index}. {summary}")
