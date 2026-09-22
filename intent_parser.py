@@ -20,7 +20,6 @@ ALLOWED_DATE_MODES = {
 }
 ALLOWED_LANGUAGES = {"English", "Roman Urdu", "Arabic"}
 ALLOWED_PAYMENT_STATUSES = {"all", "unpaid", "paid"}
-ALLOWED_GROUPINGS = {"none", "store"}
 
 
 @dataclass(frozen=True)
@@ -38,7 +37,6 @@ class OrderIntent:
     clarification: str = ""
     order_reference: str | None = None
     payment_status: str = "all"
-    group_by: str = "none" 
 
 
 def _json_object(text: str) -> dict[str, Any]:
@@ -73,7 +71,6 @@ def _validate(raw: dict[str, Any]) -> OrderIntent:
     clarification = str(raw.get("clarification") or "").strip()
     order_reference = str(raw.get("order_reference") or "").strip() or None
     payment_status = str(raw.get("payment_status") or "all").lower()
-    group_by = str(raw.get("group_by") or "none").lower()
 
     if operation not in ALLOWED_OPERATIONS:
         if needs_clarification:
@@ -97,10 +94,6 @@ def _validate(raw: dict[str, Any]) -> OrderIntent:
             payment_status = "all"
         else:
             raise ValueError("Unsupported payment status.")
-    if group_by not in ALLOWED_GROUPINGS:
-        raise ValueError(
-            "Unsupported order grouping."
-        )       
     if not 0 <= confidence <= 1:
         raise ValueError("Invalid confidence value.")
 
@@ -148,8 +141,7 @@ def _validate(raw: dict[str, Any]) -> OrderIntent:
         needs_clarification=needs_clarification,
         clarification=clarification,
         order_reference=order_reference,
-        payment_status=payment_status,y
-        group_by=group_by,
+        payment_status=payment_status,
     )
 
 
@@ -178,8 +170,7 @@ Schema:
   "needs_clarification": boolean,
   "clarification": string,
   "order_reference": string|null,
-  "payment_status": "all"|"unpaid"|"paid",
-  ""group_by": "none"|"store"
+  "payment_status": "all"|"unpaid"|"paid"
 }}
 
 Rules:
@@ -202,19 +193,6 @@ Rules:
 - For one specific order's details/status/tracking, use operation=detail and copy its UUID/order number into order_reference. If no reference is supplied, request clarification.
 - Never invent missing status/date details. Set needs_clarification=true when meaning is ambiguous.
 - Preserve an explicitly requested answer language; otherwise match the user's language.
-- If the user asks for order counts per store,
-  store-wise orders, orders grouped by store,
-  or asks which store has how many orders,
-  set group_by="store" and operation="count".
-
-- For normal order questions set group_by="none".
-
-- Store grouping can be combined with date,
-  tracking-status and payment-status filters.
-
-- Never guess a StoreId. Store-wise grouping
-  means all stores unless the user provides
-  an explicitly supported store filter.
 """
     client = Groq(api_key=api_key, timeout=20, max_retries=1)
     response = client.chat.completions.create(
