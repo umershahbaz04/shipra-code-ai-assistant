@@ -141,8 +141,8 @@ def structured_store_answer(question: str) -> str | None:
         )
     )
 
-    # Store-count question nahi hai to normal order/RAG flow continue hoga.
-    if not has_store_word or not has_count_word:
+    # Store ka sawal nahi hai to normal order/RAG flow continue hoga.
+    if not has_store_word:
         return None
 
     language = response_language(question)
@@ -167,26 +167,40 @@ def structured_store_answer(question: str) -> str | None:
             auth=auth,
         )
 
-        count, updated_auth = api.count_stores()
+        if has_count_word:
+            count, updated_auth = api.count_stores()
 
-        # Refreshed token session mein save rahega.
+            st.session_state.shipra_auth = updated_auth
+
+            if language == "Arabic":
+                return f"وفقاً لواجهة Shipra المباشرة، يوجد حالياً **{count} متجر**."
+
+            if language == "Roman Urdu":
+                return f"Live Shipra API ke mutabiq Shipra mein **{count} stores** hain."
+
+            store_label = "store" if count == 1 else "stores"
+            return f"According to the live Shipra API, there are **{count} {store_label}** in Shipra."
+
+        stores, updated_auth = api.list_all_stores()
+
         st.session_state.shipra_auth = updated_auth
+        names = [
+            store.get("StoreName")
+            or store.get("storeName")
+            or store.get("Name")
+            or store.get("name")
+            or f"Store {store.get('StoreId') or store.get('storeId') or ''}"
+            for store in stores
+        ]
 
         if language == "Arabic":
-            return f"وفقاً لواجهة Shipra المباشرة، يوجد حالياً **{count} متجر**."
+            heading = f"يوجد **{len(names)} متجر** في Shipra:"
+        elif language == "Roman Urdu":
+            heading = f"Shipra mein **{len(names)} stores** hain:"
+        else:
+            heading = f"Shipra has **{len(names)} stores**:"
 
-        if language == "Roman Urdu":
-            return (
-                f"Live Shipra API ke mutabiq Shipra mein "
-                f"**{count} stores** hain."
-            )
-
-        store_label = "store" if count == 1 else "stores"
-
-        return (
-            f"According to the live Shipra API, "
-            f"there are **{count} {store_label}** in Shipra."
-        )
+        return "\n".join([heading, *[f"{i}. {name}" for i, name in enumerate(names, 1)]])
 
     except ShipraAPIError as exc:
         return f"Shipra store request stopped safely: `{exc}`"
@@ -325,8 +339,31 @@ def _validated_live_result(data, intent: OrderIntent):
                 raise ShipraAPIError("Shipra returned a row outside the requested payment-status filter.")
 
 def structured_live_answer(question: str, history) -> str | None:
+    text = " ".join(question.lower().strip().split())
+
+    # Store-only sawal ko order parser kabhi handle nahi karega.
+    if re.search(r"\b(store|stores|stor)\b|سٹور|متجر|متاجر", text) and not re.search(
+        r"\b(order|orders|parcel|shipment)\b|آرڈر|طلب",
+        text,
+    ):
+        return None
+
+    next_words = {"next", "next page", "agla", "agla page", "اگلا"}
+    previous_words = {"previous", "previous page", "back", "pichla", "pichla page", "پچھلا"}
+    page_state = st.session_state.get("order_page")
+
+    if text in next_words | previous_words and page_state:
+        intent = page_state["intent"]
+        page = int(page_state["page"])
+        page += 1 if text in next_words else -1
+        page = max(page, 0)
+    else:
+        page = 0
+        intent = None
+
     pending_intent = st.session_state.get("pending_order_intent")
-    intent = resolve_clarification_reply(pending_intent, question) if isinstance(pending_intent, OrderIntent) else None
+    if intent is None:
+        intent = resolve_clarification_reply(pending_intent, question) if isinstance(pending_intent, OrderIntent) else None
     if intent is None:
         try:
             intent = parse_order_intent(st.secrets["GROQ_API_KEY"], question, history[:-1])
@@ -382,10 +419,30 @@ def structured_live_answer(question: str, history) -> str | None:
                 payload, updated_auth = api.order_by_reference(intent.order_reference)
             st.session_state.shipra_auth = updated_auth
             return format_order_detail(payload, language=intent.language)
-        if intent.operation == "count" and intent.status == "in_progress":
-            fetch_limit = 1000
-        else:
-            fetch_limit = 100000
+        if intent.operation == "list":
+            data, updated_auth = api.list_orders(
+                from_date,
+                to_date,
+                limit=50,
+                start=page * 50,
+                carrier_tracking_status_ids=STATUS_IDS[intent.status],
+                payment_status_id=PAYMENT_STATUS_IDS[intent.payment_status],
+            )
+            st.session_state.shipra_auth = updated_auth
+            _validated_live_result(data, intent)
+
+            total = int(data.get("count") or 0)
+            total_pages = max((total + 49) // 50, 1)
+            if page >= total_pages:
+                return "No more orders. Type `previous` to go back."
+
+            st.session_state.order_page = {"intent": intent, "page": page}
+            label = _status_label(intent.status, intent.payment_status, total)
+            result = format_order_rows(data, limit=50, language=intent.language, label=label)
+            result += f"\n\nPage **{page + 1} of {total_pages}**. Type `next` or `previous`."
+            return result
+
+        fetch_limit = 1000 if intent.status == "in_progress" else 1
         data, updated_auth = api.search_orders(
             from_date,
             to_date,
@@ -408,9 +465,7 @@ def structured_live_answer(question: str, history) -> str | None:
             if intent.language == "Arabic":
                 return f"وفقاً لواجهة Shipra المباشرة، العدد هو **{count}** خلال {scope}."
             return f"According to the live Shipra API, there are **{count} {label}** {scope}."
-        result = format_order_rows(data, limit=None, language=intent.language, label=label)
-        
-        return result
+        return format_order_rows(data, limit=50, language=intent.language, label=label)
     except (ShipraAPIError, ValueError) as exc:
         return f"Shipra live-data request stopped safely: `{exc}`"
 
