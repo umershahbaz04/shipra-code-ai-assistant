@@ -1,5 +1,6 @@
 import re
 import time
+from dataclasses import replace
 from difflib import SequenceMatcher
 from pathlib import Path
 
@@ -663,6 +664,26 @@ def structured_live_answer(question: str, history) -> str | None:
         st.session_state.pop("pending_order_intent", None)
         st.session_state.pop("pending_order_question", None)
         return None
+
+    # "All stores' orders" always means a store-separated list. This
+    # deterministic rule keeps the result correct even if the LLM parser
+    # interprets the wording as a normal all-orders request.
+    all_stores_list = bool(
+        intent.operation == "list"
+        and re.search(
+            r"\b(all|every|each|sary|sare|sab|tamam|har)\s+stores?\b",
+            text,
+            re.IGNORECASE,
+        )
+        and re.search(
+            r"\b(order|orders|parcel|shipment)\b|آرڈر|طلب",
+            text,
+            re.IGNORECASE,
+        )
+    )
+    if all_stores_list and intent.group_by != "store":
+        intent = replace(intent, group_by="store")
+
     if intent.needs_clarification:
         st.session_state.pending_order_intent = intent
         st.session_state.pending_order_question = question
@@ -763,6 +784,7 @@ def structured_live_answer(question: str, history) -> str | None:
                         to_date=to_date,
                         carrier_tracking_status_ids=STATUS_IDS[intent.status],
                         payment_status_id=PAYMENT_STATUS_IDS[intent.payment_status],
+                        validate_overall_total=False,
                     )
                     st.session_state.shipra_auth = updated_auth
                     grouped_pages = []
