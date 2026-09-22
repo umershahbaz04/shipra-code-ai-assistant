@@ -330,6 +330,15 @@ class ShipraAPI:
 
         return rows, self.auth.as_dict()
 
+    def list_sale_channel_lookups(
+        self,
+    ) -> tuple[list[dict[str, Any]], dict[str, str]]:
+        payload = self._request(
+            "GET",
+            "SaleChannel/GetAllSaleChannelLookupForSelection",
+        )
+        return _find_rows(payload), self.auth.as_dict()
+
     def count_orders_by_store(
         self,
         from_date: date | None,
@@ -430,7 +439,8 @@ class ShipraAPI:
         start: int = 0,
         carrier_tracking_status_ids: str | None = None,
         payment_status_id: int | None = None,
-        store_ids: str | None = None,        
+        store_ids: str | None = None,
+        sale_channel_config_ids: str | None = None,
     ) -> tuple[dict[str, Any], dict[str, str]]:
         body = {
             "filterModel": {
@@ -446,7 +456,8 @@ class ShipraAPI:
             "readyForAssignment": True,
             "carrierTrackingStatusIds": carrier_tracking_status_ids,
             "paymentStatusId": payment_status_id,
-            "storeIds": store_ids,            
+            "storeIds": store_ids,
+            "saleChannelConfigIds": sale_channel_config_ids,
             "orderAddressFilter": {},
         }
         payload = self._request("POST", "Order/GetAllOrders", json_body=body)
