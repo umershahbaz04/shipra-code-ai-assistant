@@ -603,8 +603,8 @@ def format_order_rows(
     for index, row in enumerate(rows[:limit], start_index):
         selected = {key: row[key] for key in preferred if key in row and row[key] not in (None, "")}
         summary = ", ".join(f"{key}: {value}" for key, value in selected.items()) or "No safe summary fields returned"
-        lines.append(f"{index}. {summary}")
-    return "\n".join(lines)
+        lines.append(f"**{index}.** {summary}")
+    return "\n\n".join(lines)
 
 
 def _mask_name(value: Any) -> str:
