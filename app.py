@@ -77,7 +77,40 @@ def response_language(question: str) -> str:
     return "English"
 
 def answer(question, history):
-    evidence = load_engine().retrieve(question, limit=8)
+    is_workflow = bool(
+        re.search(
+            r"\b(step[ -]?by[ -]?step|workflow|flow|how|kaise|kesy|kis tarhan)\b",
+            question,
+            re.IGNORECASE,
+        )
+    )
+    evidence = load_engine().retrieve(question, limit=4 if is_workflow else 8)
+
+    if is_workflow:
+        trace_query = (
+            f"{question} frontend API AxiosInterceptors backend controller "
+            "command handler mediator repository"
+        )
+        trace_evidence = load_engine().retrieve(trace_query, limit=6)
+        seen = {
+            (
+                item.meta.get("file_path"),
+                item.meta.get("start_line"),
+                item.meta.get("end_line"),
+            )
+            for item in evidence
+        }
+        for item in trace_evidence:
+            key = (
+                item.meta.get("file_path"),
+                item.meta.get("start_line"),
+                item.meta.get("end_line"),
+            )
+            if key not in seen:
+                evidence.append(item)
+                seen.add(key)
+            if len(evidence) == 8:
+                break
     context_blocks = []
     for number, item in enumerate(evidence, 1):
         meta = item.meta
@@ -99,7 +132,9 @@ For a short list question, answer directly; do not add scenario steps.
 For a code-change question, separate verified existing code from proposed code and label every proposed file/path as an assumption.
 For workflow, implementation, or "how" questions, give a numbered step-by-step guide. For every step, name the exact verified file and function/symbol, explain what happens next, and include a short exact code excerpt copied only from the supplied source. Put the code excerpt immediately below its step.
 Required workflow format: `Step N`, then `File`, then `Function/Symbol`, then the explanation with citations, followed by a fenced code block copied from that same cited source. A workflow answer without verified fenced code excerpts is invalid.
+Use at most 5 workflow steps and at most one 3-8 line code excerpt per step. Do not repeat the same source lines in multiple steps. Prefer a complete end-to-end answer over extra detail, and always finish every opened sentence and code fence.
 Never reconstruct, complete, improve, or paraphrase code inside a code block. If the exact required lines are not present in the supplied sources, state that the code excerpt is not verified instead of inventing it.
+Never put ellipses, placeholder comments, `/* ... */`, `// ...`, or incomplete statements in a code block. Copy only complete contiguous lines that are visible in the supplied source.
 When multiple files implement similar flows, keep their behavior separate by filename and function. Do not merge branch-specific loading, notification, badge, navigation, API, or error behavior into a generic claim.
 Trace a frontend API call into its verified backend controller/command/handler before describing the backend flow. If that connection is not present in the supplied sources, clearly state the evidence gap.
 Never write vague phrases such as "or similar handler". Use only the exact handler and connection proven by the supplied source.
@@ -128,7 +163,7 @@ SOURCES:\n{context}'''
                 {"role": "user", "content": prompt},
             ],
             temperature=0.1,
-            max_tokens=1400,
+            max_tokens=2200,
         )
 
     try:
@@ -137,6 +172,10 @@ SOURCES:\n{context}'''
         time.sleep(4)
         result = create_completion()
     text = result.choices[0].message.content or "Is indexed source snapshot mein jawab generate nahi hua."
+
+    # Malformed Markdown should never break the rest of the Streamlit page.
+    if text.count("```") % 2:
+        text = text.rstrip() + "\n```"
 
     # The model may still produce a references heading despite the prompt. Remove it
     # because source rendering below is deterministic and citation-aware.
