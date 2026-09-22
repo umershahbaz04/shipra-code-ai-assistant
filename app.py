@@ -630,6 +630,7 @@ def structured_live_answer(question: str, history) -> str | None:
     selected_store_name = None
     selected_channel_ids = None
     selected_channel_name = None
+    grouped_pages = None
 
     if text in next_words | previous_words and page_state:
         intent = page_state["intent"]
@@ -638,6 +639,7 @@ def structured_live_answer(question: str, history) -> str | None:
         selected_store_name = page_state.get("store_name")
         selected_channel_ids = page_state.get("channel_ids")
         selected_channel_name = page_state.get("channel_name")
+        grouped_pages = page_state.get("grouped_pages")
         page += 1 if text in next_words else -1
         page = max(page, 0)
     else:
@@ -710,6 +712,7 @@ def structured_live_answer(question: str, history) -> str | None:
 
         if (
             intent.group_by == "store"
+            and intent.operation == "count"
             and selected_store_id is None
             and selected_channel_name is None
         ):
@@ -746,6 +749,82 @@ def structured_live_answer(question: str, history) -> str | None:
             st.session_state.shipra_auth = updated_auth
             return format_order_detail(payload, language=intent.language)
         if intent.operation == "list":
+            if (
+                grouped_pages
+                or (
+                    intent.group_by == "store"
+                    and selected_store_id is None
+                    and selected_channel_name is None
+                )
+            ):
+                if not grouped_pages:
+                    grouped_data, updated_auth = api.count_orders_by_store(
+                        from_date=from_date,
+                        to_date=to_date,
+                        carrier_tracking_status_ids=STATUS_IDS[intent.status],
+                        payment_status_id=PAYMENT_STATUS_IDS[intent.payment_status],
+                    )
+                    st.session_state.shipra_auth = updated_auth
+                    grouped_pages = []
+                    for store in grouped_data.get("stores") or []:
+                        order_count = int(store.get("orderCount") or 0)
+                        for start in range(0, order_count, 50):
+                            grouped_pages.append(
+                                {
+                                    "storeId": int(store["storeId"]),
+                                    "storeName": str(store["storeName"]),
+                                    "orderCount": order_count,
+                                    "start": start,
+                                }
+                            )
+
+                if not grouped_pages:
+                    return "Live Shipra API ke mutabiq kisi store mein matching order nahi mila."
+
+                total_pages = len(grouped_pages)
+                if page >= total_pages:
+                    return "No more orders. Use Previous to go back."
+
+                current_store = grouped_pages[page]
+                data, updated_auth = api.list_orders(
+                    from_date,
+                    to_date,
+                    limit=50,
+                    start=current_store["start"],
+                    carrier_tracking_status_ids=STATUS_IDS[intent.status],
+                    payment_status_id=PAYMENT_STATUS_IDS[intent.payment_status],
+                    store_ids=str(current_store["storeId"]),
+                )
+                st.session_state.shipra_auth = updated_auth
+                _validated_live_result(data, intent)
+                _validate_order_source(data, store_id=current_store["storeId"])
+
+                st.session_state.order_page = {
+                    "intent": intent,
+                    "page": page,
+                    "total_pages": total_pages,
+                    "store_id": None,
+                    "store_name": None,
+                    "channel_ids": None,
+                    "channel_name": None,
+                    "grouped_pages": grouped_pages,
+                }
+                store_count = current_store["orderCount"]
+                label = _status_label(intent.status, intent.payment_status, store_count)
+                result = f"### Store: {current_store['storeName']}\n\n"
+                result += format_order_rows(
+                    data,
+                    limit=50,
+                    language=intent.language,
+                    label=f"{current_store['storeName']} {label}",
+                    start_index=current_store["start"] + 1,
+                )
+                result += (
+                    f"\n\nStore page **{page + 1} of {total_pages}**. "
+                    "Use the buttons below."
+                )
+                return result
+
             data, updated_auth = api.list_orders(
                 from_date,
                 to_date,
