@@ -98,9 +98,12 @@ If the source does not prove the answer, clearly say it is not verified by the i
 For a short list question, answer directly; do not add scenario steps.
 For a code-change question, separate verified existing code from proposed code and label every proposed file/path as an assumption.
 For workflow, implementation, or "how" questions, give a numbered step-by-step guide. For every step, name the exact verified file and function/symbol, explain what happens next, and include a short exact code excerpt copied only from the supplied source. Put the code excerpt immediately below its step.
+Required workflow format: `Step N`, then `File`, then `Function/Symbol`, then the explanation with citations, followed by a fenced code block copied from that same cited source. A workflow answer without verified fenced code excerpts is invalid.
 Never reconstruct, complete, improve, or paraphrase code inside a code block. If the exact required lines are not present in the supplied sources, state that the code excerpt is not verified instead of inventing it.
 When multiple files implement similar flows, keep their behavior separate by filename and function. Do not merge branch-specific loading, notification, badge, navigation, API, or error behavior into a generic claim.
 Trace a frontend API call into its verified backend controller/command/handler before describing the backend flow. If that connection is not present in the supplied sources, clearly state the evidence gap.
+Never write vague phrases such as "or similar handler". Use only the exact handler and connection proven by the supplied source.
+Check each create, update, success, failure, and finally branch independently. Do not claim that a badge, notification, navigation, or loading reset happens in all branches unless every cited branch proves it.
 Distinguish between creating or updating a record and implementing its dashboard/section. If the question is genuinely ambiguous and the two answers would differ materially, ask one concise clarification question.
 For a requested change, first show the verified existing code, then provide the proposed replacement under a clear "Proposed change" label. Never present proposed code as code already present in Shipra.
 Keep each excerpt focused: normally 3-12 lines. Cite the explanation and its excerpt with the matching source marker.
@@ -125,7 +128,7 @@ SOURCES:\n{context}'''
                 {"role": "user", "content": prompt},
             ],
             temperature=0.1,
-            max_tokens=1100,
+            max_tokens=1400,
         )
 
     try:
@@ -653,7 +656,11 @@ def structured_live_answer(question: str, history) -> str | None:
                     selected_channel_ids = selected_channel["ids"]
                     selected_channel_name = selected_channel["name"]
                 elif store_order_question:
-                    aggregate_words = r"\b(by store|store wise|store-wise|each store|every store|har store|kis store)\b"
+                    aggregate_words = (
+                        r"\b(by store|store wise|store-wise|each store|every store|"
+                        r"all stores?|har store|sary stores?|sare stores?|sab stores?|"
+                        r"tamam stores?|kis store)\b"
+                    )
                     if not re.search(aggregate_words, text):
                         return "Store ya sale channel name match nahi hua. Exact name ke sath dobara poochein."
 
