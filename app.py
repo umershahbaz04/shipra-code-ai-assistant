@@ -9,10 +9,14 @@ from rag_engine import ShipraRag
 from intent_parser import (
     OrderIntent,
     parse_order_intent,
-    parse_request_route,
     resolve_clarification_reply,
     resolve_date_range,
 )
+
+try:
+    from intent_parser import parse_request_route
+except ImportError:
+    parse_request_route = None
 from live_api_executor import execute_live_intent
 from live_api_intent import parse_live_api_intent
 from live_response_formatter import format_live_result
