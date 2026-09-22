@@ -6,7 +6,13 @@ import streamlit as st
 import streamlit.components.v1 as components
 from groq import Groq, RateLimitError
 from rag_engine import ShipraRag
-from intent_parser import OrderIntent, parse_order_intent, resolve_clarification_reply, resolve_date_range
+from intent_parser import (
+    OrderIntent,
+    parse_order_intent,
+    parse_request_route,
+    resolve_clarification_reply,
+    resolve_date_range,
+)
 from live_api_executor import execute_live_intent
 from live_api_intent import parse_live_api_intent
 from live_response_formatter import format_live_result
@@ -937,29 +943,59 @@ if q := st.chat_input("Ask about Shipra code..."):
     with st.chat_message("assistant"):
         with st.spinner("Searching verified source..."):
             try:
-                # Pehle live store request check hogi.
-                out = structured_store_answer(q)
+                pending = st.session_state.get("pending_order_intent")
+                is_navigation = " ".join(q.lower().strip().split()) in navigation_words
 
-                # Agar store request nahi hai to order flow check hoga.
-                if out is None:
-                    out = structured_live_answer(
-                        q,
-                        st.session_state.history,
+                # Clarification aur page navigation ko existing order state handle karegi.
+                if pending or is_navigation:
+                    out = structured_live_answer(q, st.session_state.history)
+                else:
+                    try:
+                        request_route = parse_request_route(
+                            st.secrets["GROQ_API_KEY"],
+                            q,
+                        )
+                    except Exception:
+                        request_route = None
+
+                    routed_q = (
+                        request_route.normalized_question
+                        if request_route and request_route.confidence >= 0.75
+                        else q
+                    )
+                    route = (
+                        request_route.route
+                        if request_route and request_route.confidence >= 0.75
+                        else None
                     )
 
-                # Non-order verified live APIs check hongi.
-                if out is None:
-                    out = structured_universal_live_answer(
-                        q,
-                        st.session_state.history,
-                    )
+                    if route == "order_live":
+                        out = structured_live_answer(
+                            routed_q,
+                            st.session_state.history,
+                        )
+                    elif route == "store_live":
+                        out = structured_store_answer(routed_q)
+                    elif route == "other_live":
+                        out = structured_universal_live_answer(
+                            routed_q,
+                            st.session_state.history,
+                        )
+                    elif route == "rag":
+                        out = answer(q, st.session_state.history[-8:])
+                    else:
+                        # Router unavailable ho to purana safe flow fallback rahega.
+                        out = structured_store_answer(q)
+                        if out is None:
+                            out = structured_live_answer(q, st.session_state.history)
+                        if out is None:
+                            out = structured_universal_live_answer(
+                                q,
+                                st.session_state.history,
+                            )
 
-                # Agar live-data request nahi hai to RAG source search hogi.
-                if out is None:
-                    out = answer(
-                        q,
-                        st.session_state.history[-8:],
-                    )
+                    if out is None:
+                        out = answer(q, st.session_state.history[-8:])
             except Exception as exc:
                 out = (
                     f"Source search failed safely: "
