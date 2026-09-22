@@ -456,8 +456,8 @@ class ShipraAPI:
             "readyForAssignment": True,
             "carrierTrackingStatusIds": carrier_tracking_status_ids,
             "paymentStatusId": payment_status_id,
-            "storeIds": store_ids,
-            "saleChannelConfigIds": sale_channel_config_ids,
+            "StoreId": store_ids,
+            "SaleChannelConfigIds": sale_channel_config_ids,
             "orderAddressFilter": {},
         }
         payload = self._request("POST", "Order/GetAllOrders", json_body=body)
