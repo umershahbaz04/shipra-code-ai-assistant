@@ -866,6 +866,117 @@ def _is_order_pdf_request(question: str) -> bool:
     return has_file_word and has_create_word
 
 
+def _explicit_date_filter(question: str) -> bool:
+    return bool(
+        re.search(
+            r"\b(today|aaj|aj|yesterday|kal|last|past|akhri|pichl\w*|"
+            r"day|days|din|week|weeks|haft\w*|month|months|mahin\w*|"
+            r"from|to|between|since|all\s+time)\b|"
+            r"\d{4}-\d{2}-\d{2}|اليوم|أمس|آخر|منذ|أيام|أسبوع|شهر",
+            question,
+            re.IGNORECASE,
+        )
+    )
+
+
+def _related_order_context(question: str, history) -> dict | None:
+    """Return context only for an immediate, clearly related follow-up."""
+    context = st.session_state.get("last_order_context")
+    if not context:
+        return None
+
+    saved_length = int(context.get("history_length", -100))
+    if len(history or []) != saved_length + 2:
+        return None
+
+    text = " ".join(question.lower().strip().split())
+    if text in {
+        "next", "next page", "agla", "agla page",
+        "previous", "previous page", "back", "pichla", "pichla page",
+    }:
+        return None
+    if re.search(
+        r"\b(all|every|sary|sare|sab|tamam)\s+orders?\b|"
+        r"\b(overall|globally|across\s+all)\b",
+        text,
+        re.IGNORECASE,
+    ):
+        return None
+
+    reference_words = bool(
+        re.search(
+            r"\b(in|un)\s+(mai|mein)\s+(se|sy)\b|"
+            r"\b(among|of)\s+(these|those|them)\b|"
+            r"\b(same|wahi|wohi|upar\s+wal\w*)\b|"
+            r"^(and|aur|or)\b",
+            text,
+            re.IGNORECASE,
+        )
+    )
+    filter_words = bool(
+        re.search(
+            r"\b(paid|unpaid|payment|delivered|returned|refunded|"
+            r"progress|pending|cancelled|transit|hold|how\s+many|count|"
+            r"kitn\w*|dikhao|show|list)\b|مدفوع|غير مدفوع|تم التسليم|مرتجع|كم",
+            text,
+            re.IGNORECASE,
+        )
+    )
+    return context if reference_words or (filter_words and len(text.split()) <= 10) else None
+
+
+def _inherit_order_filters(
+    intent: OrderIntent,
+    question: str,
+    context: dict | None,
+) -> OrderIntent:
+    """Inherit only filters omitted from a verified related order query."""
+    if not context:
+        return intent
+
+    previous = context.get("intent")
+    if not isinstance(previous, OrderIntent):
+        return intent
+
+    changes = {}
+    text = " ".join(question.lower().strip().split())
+
+    if not _explicit_date_filter(question):
+        from_date = context.get("from_date")
+        to_date = context.get("to_date")
+        if from_date is not None and to_date is not None:
+            changes.update(
+                date_mode="absolute_range",
+                date_value=None,
+                from_date=from_date.isoformat() if hasattr(from_date, "isoformat") else str(from_date),
+                to_date=to_date.isoformat() if hasattr(to_date, "isoformat") else str(to_date),
+            )
+        else:
+            changes.update(
+                date_mode="all_time",
+                date_value=None,
+                from_date=None,
+                to_date=None,
+            )
+
+    explicit_all_orders = bool(
+        re.search(r"\b(all|every|sary|sare|sab|tamam)\s+orders?\b", text)
+    )
+    if intent.status == "all" and not explicit_all_orders:
+        changes["status"] = previous.status
+
+    explicit_all_payments = bool(
+        re.search(r"\b(all|both)\s+(payment|payments|paid|unpaid)\b", text)
+    )
+    if intent.payment_status == "all" and not explicit_all_payments:
+        changes["payment_status"] = previous.payment_status
+
+    if intent.group_by == "none" and previous.group_by == "store":
+        changes["group_by"] = "store"
+
+    return replace(intent, **changes) if changes else intent
+
+
 def _remember_order_export(
     intent: OrderIntent,
     from_date,
@@ -894,6 +1005,10 @@ def _remember_order_export(
             if expected_count is not None
             else None
         ),
+    }
+    st.session_state.last_order_context = {
+        **st.session_state.last_order_export,
+        "history_length": len(st.session_state.get("history", [])),
     }
 
 
@@ -1166,8 +1281,10 @@ def structured_live_answer(question: str, history) -> str | None:
             st.session_state.pop("order_page", None)
 
     pending_intent = st.session_state.get("pending_order_intent")
+    pending_context = st.session_state.get("pending_order_context")
+    resolving_pending = isinstance(pending_intent, OrderIntent)
     if intent is None:
-        intent = resolve_clarification_reply(pending_intent, question) if isinstance(pending_intent, OrderIntent) else None
+        intent = resolve_clarification_reply(pending_intent, question) if resolving_pending else None
     if intent is None:
         try:
             intent = parse_order_intent(st.secrets["GROQ_API_KEY"], question, history[:-1])
@@ -1220,11 +1337,25 @@ def structured_live_answer(question: str, history) -> str | None:
     if all_stores_list and intent.group_by != "store":
         intent = replace(intent, group_by="store")
 
+    follow_context = (
+        pending_context
+        if resolving_pending and pending_context
+        else _related_order_context(original_question, history)
+    )
+    intent = _inherit_order_filters(
+        intent,
+        original_question,
+        follow_context,
+    )
+
     if intent.needs_clarification:
         st.session_state.pending_order_intent = intent
         st.session_state.pending_order_question = question
+        if follow_context:
+            st.session_state.pending_order_context = follow_context
         return _clarification_message(intent)
     st.session_state.pop("pending_order_intent", None)
+    st.session_state.pop("pending_order_context", None)
     store_question = st.session_state.pop("pending_order_question", None) or question
 
     auth = st.session_state.get("shipra_auth")
@@ -1257,6 +1388,11 @@ def structured_live_answer(question: str, history) -> str | None:
                 if selected_channel:
                     selected_channel_ids = selected_channel["ids"]
                     selected_channel_name = selected_channel["name"]
+                elif follow_context and not store_order_question:
+                    selected_store_id = follow_context.get("store_id")
+                    selected_store_name = follow_context.get("store_name")
+                    selected_channel_ids = follow_context.get("channel_ids") or None
+                    selected_channel_name = follow_context.get("channel_name")
                 elif store_order_question:
                     aggregate_words = (
                         r"\b(by store|store wise|store-wise|each store|every store|"
@@ -1656,6 +1792,8 @@ with st.sidebar:
         st.session_state.pop("order_page", None)
         st.session_state.pop("pending_order_intent", None)
         st.session_state.pop("pending_order_question", None)
+        st.session_state.pop("pending_order_context", None)
+        st.session_state.pop("last_order_context", None)
         st.session_state.pop("last_order_export", None)
         st.session_state.pop("order_pdf", None)
         st.rerun()
@@ -1666,6 +1804,8 @@ with st.sidebar:
         st.success(f"Connected as {st.session_state.shipra_auth.get('username', 'Shipra user')}")
         if st.button("Disconnect Shipra", use_container_width=True):
             st.session_state.pop("shipra_auth", None)
+            st.session_state.pop("pending_order_context", None)
+            st.session_state.pop("last_order_context", None)
             st.session_state.pop("last_order_export", None)
             st.session_state.pop("order_pdf", None)
             st.rerun()
