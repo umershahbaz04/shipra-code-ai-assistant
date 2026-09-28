@@ -5,7 +5,7 @@ from datetime import datetime
 from html import escape
 from io import BytesIO
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 from reportlab.lib import colors
 from reportlab.lib.enums import TA_CENTER
@@ -52,13 +52,69 @@ def safe_pdf_filename(title: str) -> str:
     return f"{clean[:80] or 'shipra_orders'}.pdf"
 
 
+def _flatten_details(
+    value: Any,
+    path: str = "",
+) -> Iterator[tuple[str, str]]:
+    """Yield every value from a nested Shipra order response."""
+    if isinstance(value, dict):
+        if not value:
+            yield path or "value", "{}"
+            return
+        for key, child in value.items():
+            child_path = f"{path}.{key}" if path else str(key)
+            yield from _flatten_details(child, child_path)
+        return
+
+    if isinstance(value, list):
+        if not value:
+            yield path or "value", "[]"
+            return
+        for index, child in enumerate(value, 1):
+            child_path = f"{path}[{index}]" if path else f"item[{index}]"
+            yield from _flatten_details(child, child_path)
+        return
+
+    if value is None:
+        text = "null"
+    elif isinstance(value, bool):
+        text = "true" if value else "false"
+    else:
+        text = str(value)
+    yield path or "value", text
+
+
+def _order_payload(row: dict[str, Any]) -> dict[str, Any]:
+    payload = row.get("details", row)
+    if not isinstance(payload, dict):
+        return {"value": payload}
+    result = payload.get("result", payload)
+    return result if isinstance(result, dict) else {"result": result}
+
+
+def _order_reference(payload: dict[str, Any], fallback: int) -> str:
+    order = payload.get("order") or payload.get("Order") or payload
+    if isinstance(order, dict):
+        return _value(
+            order,
+            "orderNo",
+            "OrderNo",
+            "refNo",
+            "RefNo",
+            "orderId",
+            "OrderId",
+            default=f"Order {fallback}",
+        )
+    return f"Order {fallback}"
+
+
 def build_orders_pdf(
     groups: list[dict[str, Any]],
     *,
     title: str,
     filter_text: str,
 ) -> bytes:
-    """Create a downloadable PDF from already validated Shipra order rows."""
+    """Create a PDF containing every field returned by each order-detail API."""
     buffer = BytesIO()
     font = _font_name()
     styles = getSampleStyleSheet()
@@ -77,6 +133,7 @@ def build_orders_pdf(
         fontName=font,
         fontSize=8,
         leading=10,
+        wordWrap="CJK",
     )
     heading_style = ParagraphStyle(
         "ShipraHeading",
@@ -111,6 +168,7 @@ def build_orders_pdf(
         Spacer(1, 5 * mm),
     ]
 
+    order_number = 0
     for group_index, group in enumerate(groups):
         group_name = str(group.get("name") or "Orders")
         rows = group.get("rows") or []
@@ -121,55 +179,51 @@ def build_orders_pdf(
             )
         )
 
-        table_rows: list[list[Any]] = [
-            ["#", "Order No", "Order Date", "Amount", "Tracking Status"]
-        ]
-        for index, row in enumerate(rows, 1):
-            table_rows.append(
-                [
-                    str(index),
-                    Paragraph(escape(_value(row, "OrderNo", "orderNo", "RefNo", "refNo")), body_style),
-                    Paragraph(escape(_value(row, "OrderDate", "orderDate")), body_style),
-                    Paragraph(escape(_value(row, "Amount", "amount")), body_style),
-                    Paragraph(
-                        escape(
-                            _value(
-                                row,
-                                "CarrierTrackingStatus",
-                                "carrierTrackingStatus",
-                                "Status",
-                                "status",
-                            )
-                        ),
-                        body_style,
-                    ),
-                ]
+        for row_index, row in enumerate(rows):
+            order_number += 1
+            payload = _order_payload(row)
+            reference = _order_reference(payload, order_number)
+            story.append(
+                Paragraph(
+                    escape(f"Order {order_number}: {reference}"),
+                    heading_style,
+                )
             )
+            table_rows: list[list[Any]] = [["Field", "Value"]]
+            for field, value in _flatten_details(payload):
+                table_rows.append(
+                    [
+                        Paragraph(escape(field), body_style),
+                        Paragraph(escape(value).replace("\n", "<br/>"), body_style),
+                    ]
+                )
 
-        table = Table(
-            table_rows,
-            repeatRows=1,
-            colWidths=[12 * mm, 42 * mm, 58 * mm, 30 * mm, 90 * mm],
-        )
-        table.setStyle(
-            TableStyle(
-                [
-                    ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#563AD5")),
-                    ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
-                    ("FONTNAME", (0, 0), (-1, -1), font),
-                    ("FONTSIZE", (0, 0), (-1, 0), 8),
-                    ("ALIGN", (0, 0), (0, -1), "CENTER"),
-                    ("VALIGN", (0, 0), (-1, -1), "TOP"),
-                    ("GRID", (0, 0), (-1, -1), 0.35, colors.HexColor("#C8C8C8")),
-                    ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#F5F3FF")]),
-                    ("TOPPADDING", (0, 0), (-1, -1), 4),
-                    ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
-                ]
+            table = Table(
+                table_rows,
+                repeatRows=1,
+                colWidths=[72 * mm, 192 * mm],
             )
-        )
-        story.append(table)
-        if group_index + 1 < len(groups):
-            story.append(PageBreak())
+            table.setStyle(
+                TableStyle(
+                    [
+                        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#563AD5")),
+                        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+                        ("FONTNAME", (0, 0), (-1, -1), font),
+                        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                        ("GRID", (0, 0), (-1, -1), 0.35, colors.HexColor("#C8C8C8")),
+                        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#F5F3FF")]),
+                        ("TOPPADDING", (0, 0), (-1, -1), 4),
+                        ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+                    ]
+                )
+            )
+            story.append(table)
+            is_last_order = (
+                group_index == len(groups) - 1
+                and row_index == len(rows) - 1
+            )
+            if not is_last_order:
+                story.append(PageBreak())
 
     document.build(story)
     return buffer.getvalue()
