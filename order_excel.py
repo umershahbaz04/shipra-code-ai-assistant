@@ -12,6 +12,7 @@ from openpyxl.worksheet.table import Table, TableStyleInfo
 
 
 HEADERS = (
+    "No.",
     "Order",
     "Date",
     "Customer",
@@ -99,6 +100,7 @@ def _excel_row(row: dict[str, Any], group_name: str, number: int) -> list[Any]:
     source = _pick(summary, "storeName", "saleChannelName", "channelName")
 
     return [
+        number,
         _order_reference(payload, number),
         _pick(order, "orderDate", default=_pick(summary, "orderDate")) or "-",
         _pick(address, "customerName", default=_pick(summary, "customerName")) or "-",
@@ -174,13 +176,13 @@ def build_orders_excel(
     sheet.sheet_view.showGridLines = False
     sheet.row_dimensions[5].height = 24
 
-    widths = (20, 22, 24, 24, 14, 15, 22, 10, 28, 22)
+    widths = (8, 20, 22, 24, 24, 14, 15, 22, 10, 28, 22)
     for index, width in enumerate(widths, 1):
         sheet.column_dimensions[get_column_letter(index)].width = width
     for row in sheet.iter_rows(min_row=6):
         for cell in row:
             cell.alignment = Alignment(vertical="top", wrap_text=True)
-    for cell in sheet["E"][5:]:
+    for cell in sheet["F"][5:]:
         cell.number_format = "#,##0.00"
 
     if total_orders:
