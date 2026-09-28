@@ -560,6 +560,55 @@ def _format_store_order_counts(
 
     return "\n".join(lines)
 
+
+def _store_order_extreme(question: str) -> str | None:
+    """Return least/most only for explicit store-order comparison questions."""
+    text = " ".join(question.lower().strip().split())
+    has_store = bool(re.search(r"\b(store|stores|stor)\b|سٹور|متجر", text))
+    has_orders = bool(re.search(r"\b(order|orders|parcel|shipment)\b|آرڈر|طلب", text))
+    if not (has_store and has_orders):
+        return None
+    if re.search(
+        r"\b(fewest|least|lowest|minimum|min)\b|"
+        r"\b(sab|sary|sare)\s+(?:se|sy)\s+kam\b",
+        text,
+    ):
+        return "least"
+    if re.search(
+        r"\b(most|highest|maximum|max)\b|"
+        r"\b(sab|sary|sare)\s+(?:se|sy)\s+(?:zyada|ziada|zayada)\b",
+        text,
+    ):
+        return "most"
+    return None
+
+
+def _format_store_extreme(data: dict, extreme: str, language: str) -> str:
+    stores = data.get("stores") or []
+    if not stores:
+        return "Live Shipra API mein koi store-order data nahi mila."
+
+    target_count = (
+        min(int(store.get("orderCount") or 0) for store in stores)
+        if extreme == "least"
+        else max(int(store.get("orderCount") or 0) for store in stores)
+    )
+    matches = [
+        store
+        for store in stores
+        if int(store.get("orderCount") or 0) == target_count
+    ]
+    names = ", ".join(str(store.get("storeName") or "Unknown store") for store in matches)
+
+    if language == "Arabic":
+        direction = "الأقل" if extreme == "least" else "الأكثر"
+        return f"وفقاً لواجهة Shipra المباشرة، المتجر {direction} طلبات هو **{names}** بعدد **{target_count} طلب**."
+    if language == "English":
+        direction = "fewest" if extreme == "least" else "most"
+        return f"According to the live Shipra API, **{names}** has the {direction} orders: **{target_count}**."
+    direction = "sab se kam" if extreme == "least" else "sab se zyada"
+    return f"Live Shipra API ke mutabiq **{names}** ke {direction} orders hain: **{target_count} orders**."
+
 def _validated_live_result(data, intent: OrderIntent):
     expected_ids = STATUS_IDS[intent.status]
     if expected_ids is not None:
@@ -846,6 +895,12 @@ def structured_order_pdf_answer(question: str, history=None) -> str | None:
 
 def structured_live_answer(question: str, history) -> str | None:
     text = " ".join(question.lower().strip().split())
+    original_question = question
+    if history and history[-1].get("role") == "user":
+        original_question = str(history[-1].get("content") or question)
+    store_extreme = _store_order_extreme(
+        f"{question} {original_question}"
+    )
 
     # Store-only sawal ko order parser kabhi handle nahi karega.
     if re.search(r"\b(store|stores|stor)\b|سٹور|متجر|متاجر", text) and not re.search(
@@ -933,7 +988,11 @@ def structured_live_answer(question: str, history) -> str | None:
             and re.search(r"\b(order|orders|parcel|shipment)\b|آرڈر|طلب", store_question, re.IGNORECASE)
         )
 
-        if selected_store_id is None and text not in next_words | previous_words:
+        if (
+            selected_store_id is None
+            and text not in next_words | previous_words
+            and store_extreme is None
+        ):
             selected_store, updated_auth = _resolve_store(api, store_question)
             st.session_state.shipra_auth = updated_auth
 
@@ -950,8 +1009,9 @@ def structured_live_answer(question: str, history) -> str | None:
                 elif store_order_question:
                     aggregate_words = (
                         r"\b(by store|store wise|store-wise|each store|every store|"
-                        r"all stores?|har store|sary stores?|sare stores?|sab stores?|"
-                        r"tamam stores?|kis store)\b"
+                        r"all stores?|which store|har store|sary stores?|sare stores?|"
+                        r"sab stores?|tamam stores?|kis store|fewest|least|lowest|"
+                        r"most|highest|minimum|maximum)\b"
                     )
                     if not re.search(aggregate_words, text):
                         return "Store ya sale channel name match nahi hua. Exact name ke sath dobara poochein."
@@ -960,6 +1020,48 @@ def structured_live_answer(question: str, history) -> str | None:
             if intent.operation == "list":
                 return f"{selected_channel_name} ke liye koi active connection ya matching order nahi mila."
             return f"Live Shipra API ke mutabiq **{selected_channel_name} ke 0 orders** hain."
+
+        if (
+            store_extreme
+            and selected_store_id is None
+            and selected_channel_name is None
+        ):
+            data, updated_auth = api.count_orders_by_store(
+                from_date=from_date,
+                to_date=to_date,
+                carrier_tracking_status_ids=STATUS_IDS[intent.status],
+                payment_status_id=PAYMENT_STATUS_IDS[intent.payment_status],
+                validate_overall_total=False,
+            )
+            st.session_state.shipra_auth = updated_auth
+            stores = data.get("stores") or []
+            if not stores:
+                return "Live Shipra API mein koi store-order data nahi mila."
+            target_count = (
+                min(int(store.get("orderCount") or 0) for store in stores)
+                if store_extreme == "least"
+                else max(int(store.get("orderCount") or 0) for store in stores)
+            )
+            target_stores = [
+                store
+                for store in stores
+                if int(store.get("orderCount") or 0) == target_count
+            ]
+            _remember_order_export(
+                intent,
+                from_date,
+                to_date,
+                stores=target_stores,
+                expected_count=sum(
+                    int(store.get("orderCount") or 0)
+                    for store in target_stores
+                ),
+            )
+            return _format_store_extreme(
+                data,
+                store_extreme,
+                response_language(original_question),
+            )
 
         if (
             intent.group_by == "store"
