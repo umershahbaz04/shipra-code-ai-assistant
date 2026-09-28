@@ -273,6 +273,8 @@ Rules:
   calendar month and rolling 30 days.
 - If no date was requested, use all_time.
 - If the user asks to show/dikhao/list orders, operation is list; if asking how many/kitny/count, it is count.
+- If the user asks to create/download a PDF, file, document, or report containing
+  matching orders, operation is list so the exact filtered order rows can be exported.
 - For one specific order's details/status/tracking, use operation=detail and copy its UUID/order number into order_reference. If no reference is supplied, request clarification.
 - Never invent missing status/date details. Set needs_clarification=true when meaning is ambiguous.
 - Preserve an explicitly requested answer language; otherwise match the user's language.
