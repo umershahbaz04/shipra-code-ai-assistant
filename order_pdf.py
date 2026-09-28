@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import re
 from datetime import datetime
 from html import escape
@@ -9,8 +8,8 @@ from pathlib import Path
 from typing import Any
 
 from reportlab.lib import colors
-from reportlab.lib.enums import TA_CENTER
-from reportlab.lib.pagesizes import A4, landscape
+from reportlab.lib.enums import TA_CENTER, TA_RIGHT
+from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
 from reportlab.lib.units import mm
 from reportlab.pdfbase import pdfmetrics
@@ -53,206 +52,137 @@ def safe_pdf_filename(title: str) -> str:
     return f"{clean[:80] or 'shipra_orders'}.pdf"
 
 
-SECTION_NAMES = {
-    "order": "Order Information",
-    "orderItems": "Order Items",
-    "orderAddress": "Customer & Delivery Address",
-    "orderAddressAdditional": "Additional Address",
-    "orderNote": "Order Note",
-    "orderTax": "Taxes",
-    "orderBoxes": "Boxes & Dimensions",
-    "metafields": "Metafields",
-    "settingConfig": "Configured Fields",
-}
+def _pick(data: dict[str, Any], *keys: str, default: Any = None) -> Any:
+    if not isinstance(data, dict):
+        return default
+    lowered = {str(key).lower(): value for key, value in data.items()}
+    for key in keys:
+        value = lowered.get(key.lower())
+        if value not in (None, ""):
+            return value
+    return default
 
 
-def _is_empty(value: Any) -> bool:
-    if value is None or value == "":
-        return True
-    if isinstance(value, dict):
-        return not value or all(_is_empty(child) for child in value.values())
-    if isinstance(value, list):
-        return not value or all(_is_empty(child) for child in value)
-    return False
+def _shown(value: Any) -> bool:
+    return value not in (None, "", [], {})
 
 
-def _label(name: str) -> str:
-    if name in SECTION_NAMES:
-        return SECTION_NAMES[name]
-    text = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", str(name))
-    text = text.replace("_", " ").strip()
-    text = re.sub(r"\bId\b", "ID", text, flags=re.IGNORECASE)
-    text = re.sub(r"\bUrl\b", "URL", text, flags=re.IGNORECASE)
-    text = re.sub(r"\bSku\b", "SKU", text, flags=re.IGNORECASE)
-    return text[:1].upper() + text[1:]
+def _paragraph(value: Any, style: ParagraphStyle) -> Paragraph:
+    return Paragraph(escape(str(value)).replace("\n", "<br/>"), style)
 
 
-def _decoded(value: Any) -> Any:
+def _format_date(value: Any) -> Any:
     if not isinstance(value, str):
         return value
-    text = value.strip()
-    if not text or text[:1] not in "[{":
-        return value
+    return value.replace("T", " ").split(".", 1)[0]
+
+
+def _named_value(value: Any) -> Any:
+    if isinstance(value, (int, float)):
+        return None
+    text = str(value or "").strip()
+    if re.fullmatch(r"\d+(?:_\d+)?", text):
+        return None
+    return text or None
+
+
+def _amount(value: Any) -> Any:
+    if not _shown(value):
+        return None
     try:
-        return json.loads(text)
+        return f"{float(value):,.2f}"
     except (TypeError, ValueError):
         return value
 
 
-def _text(value: Any) -> str:
-    if isinstance(value, bool):
-        return "Yes" if value else "No"
-    return str(value)
+def _section_heading(title: str, style: ParagraphStyle) -> Paragraph:
+    return Paragraph(escape(title), style)
 
 
-def _details_table(
+def _info_table(
     pairs: list[tuple[str, Any]],
     *,
     body_style: ParagraphStyle,
     font: str,
-) -> Table:
+) -> Table | None:
+    pairs = [(label, value) for label, value in pairs if _shown(value)]
+    if not pairs:
+        return None
     rows: list[list[Any]] = []
     for offset in range(0, len(pairs), 2):
         row: list[Any] = []
-        for name, value in pairs[offset : offset + 2]:
+        for label, value in pairs[offset : offset + 2]:
             row.extend(
                 [
-                    Paragraph(f"<b>{escape(_label(name))}</b>", body_style),
-                    Paragraph(
-                        escape(_text(value)).replace("\n", "<br/>"),
-                        body_style,
-                    ),
+                    Paragraph(f"<b>{escape(label)}</b>", body_style),
+                    _paragraph(value, body_style),
                 ]
             )
         while len(row) < 4:
             row.extend(["", ""])
         rows.append(row)
-
-    table = Table(
-        rows,
-        colWidths=[38 * mm, 94 * mm, 38 * mm, 94 * mm],
-        splitByRow=1,
-    )
+    table = Table(rows, colWidths=[29 * mm, 61 * mm, 29 * mm, 61 * mm])
     table.setStyle(
         TableStyle(
             [
                 ("FONTNAME", (0, 0), (-1, -1), font),
                 ("VALIGN", (0, 0), (-1, -1), "TOP"),
-                ("GRID", (0, 0), (-1, -1), 0.3, colors.HexColor("#D5D5D5")),
-                ("BACKGROUND", (0, 0), (0, -1), colors.HexColor("#F2F0FF")),
-                ("BACKGROUND", (2, 0), (2, -1), colors.HexColor("#F2F0FF")),
-                ("TOPPADDING", (0, 0), (-1, -1), 3),
-                ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+                ("GRID", (0, 0), (-1, -1), 0.3, colors.HexColor("#DADDE5")),
+                ("BACKGROUND", (0, 0), (0, -1), colors.HexColor("#F3F1FF")),
+                ("BACKGROUND", (2, 0), (2, -1), colors.HexColor("#F3F1FF")),
+                ("TOPPADDING", (0, 0), (-1, -1), 4),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
             ]
         )
     )
     return table
 
 
-def _append_section(
-    story: list[Any],
-    name: str,
-    value: Any,
+def _items_table(
+    items: list[dict[str, Any]],
     *,
     body_style: ParagraphStyle,
-    heading_style: ParagraphStyle,
     font: str,
-) -> None:
-    value = _decoded(value)
-    if _is_empty(value):
-        return
-
-    title = _label(name)
-    if isinstance(value, dict):
-        scalar_pairs: list[tuple[str, Any]] = []
-        nested: list[tuple[str, Any]] = []
-        for key, child in value.items():
-            child = _decoded(child)
-            if _is_empty(child):
-                continue
-            if isinstance(child, (dict, list)):
-                nested.append((key, child))
-            else:
-                scalar_pairs.append((key, child))
-
-        if not scalar_pairs and not nested:
-            return
-        story.append(Paragraph(escape(title), heading_style))
-        if scalar_pairs:
-            story.append(
-                _details_table(
-                    scalar_pairs,
-                    body_style=body_style,
-                    font=font,
-                )
-            )
-        for key, child in nested:
-            _append_section(
-                story,
-                key,
-                child,
-                body_style=body_style,
-                heading_style=heading_style,
-                font=font,
-            )
-        return
-
-    if isinstance(value, list):
-        visible = []
-        for item in value:
-            item = _decoded(item)
-            if not _is_empty(item):
-                visible.append(item)
-        if not visible:
-            return
-        story.append(Paragraph(escape(title), heading_style))
-        for index, item in enumerate(visible, 1):
-            item_title = f"{title[:-1] if title.endswith('s') else title} {index}"
-            if isinstance(item, dict):
-                pairs: list[tuple[str, Any]] = []
-                nested: list[tuple[str, Any]] = []
-                for key, child in item.items():
-                    child = _decoded(child)
-                    if _is_empty(child):
-                        continue
-                    if isinstance(child, (dict, list)):
-                        nested.append((key, child))
-                    else:
-                        pairs.append((key, child))
-                if len(visible) > 1:
-                    story.append(
-                        Paragraph(
-                            f"<b>{escape(item_title)}</b>",
-                            body_style,
-                        )
-                    )
-                if pairs:
-                    story.append(
-                        _details_table(
-                            pairs,
-                            body_style=body_style,
-                            font=font,
-                        )
-                    )
-                for key, child in nested:
-                    _append_section(
-                        story,
-                        key,
-                        child,
-                        body_style=body_style,
-                        heading_style=heading_style,
-                        font=font,
-                    )
-            else:
-                story.append(Paragraph(escape(_text(item)), body_style))
-        return
-
-    story.append(
-        Paragraph(
-            f"<b>{escape(title)}:</b> {escape(_text(value))}",
-            body_style,
+) -> Table | None:
+    if not items:
+        return None
+    rows: list[list[Any]] = [["#", "Product / SKU", "Qty", "Unit Price", "Discount"]]
+    for index, item in enumerate(items, 1):
+        name = _pick(item, "productName", "name", default=f"Item {index}")
+        sku = _pick(item, "stockSku", "sku")
+        product = str(name)
+        if _shown(sku):
+            product += f"\nSKU: {sku}"
+        rows.append(
+            [
+                str(index),
+                _paragraph(product, body_style),
+                _paragraph(_pick(item, "quantity", default="-"), body_style),
+                _paragraph(_amount(_pick(item, "price", "unitRate")) or "-", body_style),
+                _paragraph(_amount(_pick(item, "discount")) or "-", body_style),
+            ]
+        )
+    table = Table(
+        rows,
+        repeatRows=1,
+        colWidths=[10 * mm, 80 * mm, 20 * mm, 35 * mm, 35 * mm],
+    )
+    table.setStyle(
+        TableStyle(
+            [
+                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#563AD5")),
+                ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+                ("FONTNAME", (0, 0), (-1, -1), font),
+                ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                ("ALIGN", (0, 0), (0, -1), "CENTER"),
+                ("GRID", (0, 0), (-1, -1), 0.3, colors.HexColor("#DADDE5")),
+                ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#FAFAFD")]),
+                ("TOPPADDING", (0, 0), (-1, -1), 5),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+            ]
         )
     )
+    return table
 
 
 def _order_payload(row: dict[str, Any]) -> dict[str, Any]:
@@ -285,121 +215,177 @@ def build_orders_pdf(
     title: str,
     filter_text: str,
 ) -> bytes:
-    """Create a PDF containing every field returned by each order-detail API."""
+    """Create a concise professional order report from verified API data."""
     buffer = BytesIO()
     font = _font_name()
     styles = getSampleStyleSheet()
-    title_style = ParagraphStyle(
-        "ShipraTitle",
-        parent=styles["Title"],
-        fontName=font,
-        fontSize=18,
-        leading=22,
-        alignment=TA_CENTER,
-        spaceAfter=8,
+    brand_style = ParagraphStyle(
+        "ShipraBrand", parent=styles["Title"], fontName=font,
+        fontSize=20, leading=22, textColor=colors.HexColor("#563AD5"),
+    )
+    report_style = ParagraphStyle(
+        "ShipraReport", parent=styles["Heading2"], fontName=font,
+        fontSize=10, leading=12, textColor=colors.HexColor("#696D78"),
     )
     body_style = ParagraphStyle(
-        "ShipraBody",
-        parent=styles["BodyText"],
-        fontName=font,
-        fontSize=8,
-        leading=10,
-        wordWrap="CJK",
+        "ShipraBody", parent=styles["BodyText"], fontName=font,
+        fontSize=8.5, leading=11, wordWrap="CJK",
+    )
+    small_style = ParagraphStyle(
+        "ShipraSmall", parent=body_style, fontSize=7.2, leading=9,
+        textColor=colors.HexColor("#696D78"),
+    )
+    order_no_style = ParagraphStyle(
+        "ShipraOrderNo", parent=styles["Heading1"], fontName=font,
+        fontSize=14, leading=17, alignment=TA_RIGHT,
+        textColor=colors.HexColor("#22242A"),
     )
     heading_style = ParagraphStyle(
-        "ShipraHeading",
-        parent=styles["Heading2"],
-        fontName=font,
-        fontSize=12,
-        leading=15,
-        spaceBefore=8,
-        spaceAfter=6,
+        "ShipraHeading", parent=styles["Heading2"], fontName=font,
+        fontSize=10.5, leading=13, textColor=colors.HexColor("#30226F"),
+        spaceBefore=7, spaceAfter=4,
     )
-
     document = SimpleDocTemplate(
-        buffer,
-        pagesize=landscape(A4),
-        rightMargin=10 * mm,
-        leftMargin=10 * mm,
-        topMargin=10 * mm,
-        bottomMargin=10 * mm,
-        title=title,
-        author="Shipra AI Assistant",
+        buffer, pagesize=A4, rightMargin=15 * mm, leftMargin=15 * mm,
+        topMargin=14 * mm, bottomMargin=14 * mm,
+        title=title, author="Shipra AI Assistant",
     )
 
     total_orders = sum(len(group.get("rows") or []) for group in groups)
-    story = [
-        Paragraph(escape(title), title_style),
-        Paragraph(escape(f"Filter: {filter_text}"), body_style),
-        Paragraph(
-            f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')} | "
-            f"Total orders: {total_orders}",
-            body_style,
-        ),
-        Spacer(1, 5 * mm),
-    ]
-
+    generated_at = datetime.now().strftime("%Y-%m-%d %H:%M")
+    story: list[Any] = []
     order_number = 0
-    for group_index, group in enumerate(groups):
-        group_name = str(group.get("name") or "Orders")
-        rows = group.get("rows") or []
-        story.append(
-            Paragraph(
-                escape(f"Store: {group_name} ({len(rows)} orders)"),
-                heading_style,
-            )
-        )
 
+    for group_index, group in enumerate(groups):
+        group_name = str(group.get("name") or "All stores")
+        rows = group.get("rows") or []
         for row_index, row in enumerate(rows):
             order_number += 1
             payload = _order_payload(row)
+            summary = row.get("summary") if isinstance(row, dict) else {}
+            summary = summary if isinstance(summary, dict) else {}
+            order = payload.get("order") or payload.get("Order") or payload
+            order = order if isinstance(order, dict) else {}
+            address = payload.get("orderAddress") or payload.get("OrderAddress") or {}
+            address = address if isinstance(address, dict) else {}
+            items = payload.get("orderItems") or payload.get("OrderItems") or []
+            items = [item for item in items if isinstance(item, dict)] if isinstance(items, list) else []
+            boxes = payload.get("orderBoxes") or payload.get("OrderBoxes") or []
+            boxes = [box for box in boxes if isinstance(box, dict)] if isinstance(boxes, list) else []
             reference = _order_reference(payload, order_number)
-            story.append(
+
+            header = Table(
+                [[
+                    [Paragraph("SHIPRA", brand_style), Paragraph("ORDER REPORT", report_style)],
+                    Paragraph(f"Order #{escape(reference)}", order_no_style),
+                ]],
+                colWidths=[90 * mm, 90 * mm],
+            )
+            header.setStyle(TableStyle([
+                ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                ("LINEBELOW", (0, 0), (-1, -1), 1.2, colors.HexColor("#563AD5")),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 7),
+            ]))
+            story.extend([
+                header,
+                Spacer(1, 2 * mm),
                 Paragraph(
-                    escape(f"Order {order_number}: {reference}"),
-                    heading_style,
+                    escape(f"{filter_text} | Order {order_number} of {total_orders} | Generated {generated_at}"),
+                    small_style,
+                ),
+            ])
+
+            payment_id = _pick(order, "paymentStatusId")
+            payment_status = _pick(order, "paymentStatus", "paymentStatusName")
+            if not _shown(payment_status):
+                payment_status = {1: "Unpaid", 2: "Paid"}.get(payment_id)
+            tracking_status = _pick(
+                summary, "carrierTrackingStatus", "status",
+                default=_pick(order, "carrierTrackingStatus", "status"),
+            )
+            overview = _info_table([
+                ("Order Date", _format_date(_pick(order, "orderDate", default=_pick(summary, "orderDate")))),
+                ("Store", group_name),
+                ("Order Status", tracking_status),
+                ("Payment Status", payment_status),
+                ("Items", _pick(order, "itemsCount", default=len(items) or None)),
+                ("Sales Channel", _pick(summary, "saleChannelName", "channelName")),
+            ], body_style=body_style, font=font)
+            if overview:
+                story.extend([_section_heading("Order Overview", heading_style), overview])
+
+            city_area = " / ".join(
+                str(value) for value in [_named_value(_pick(address, "city")), _named_value(_pick(address, "area"))]
+                if _shown(value)
+            )
+            customer = _info_table([
+                ("Customer", _pick(address, "customerName")),
+                ("Mobile", _pick(address, "mobile1", "phone")),
+                ("Email", _pick(address, "email")),
+                ("City / Area", city_area),
+                ("Delivery Address", _pick(address, "customerFullAddress", "fullAddress", "streetAddress")),
+                ("Country", _named_value(_pick(address, "countryName", "country"))),
+            ], body_style=body_style, font=font)
+            if customer:
+                story.extend([_section_heading("Customer & Delivery", heading_style), customer])
+
+            item_table = _items_table(items, body_style=body_style, font=font)
+            if item_table:
+                story.extend([_section_heading("Order Items", heading_style), item_table])
+
+            financial = _info_table([
+                ("Item Value", _amount(_pick(order, "itemValue"))),
+                ("Delivery Charges", _amount(_pick(order, "deliveryCharges"))),
+                ("Shipping Charges", _amount(_pick(order, "cShippingCharges", "shippingCharges"))),
+                ("Discount", _amount(_pick(order, "discount"))),
+                ("VAT / Tax", _amount(_pick(order, "vat", "tax"))),
+                ("Total Amount", _amount(_pick(order, "amount", default=_pick(summary, "amount")))),
+                ("Actual Amount", _amount(_pick(order, "actualAmount"))),
+            ], body_style=body_style, font=font)
+            if financial:
+                story.extend([_section_heading("Payment Summary", heading_style), financial])
+
+            dimensions = []
+            for box in boxes:
+                length, width, height = (
+                    _pick(box, "length"), _pick(box, "width"), _pick(box, "height")
                 )
-            )
-            preferred_sections = (
-                "order",
-                "orderItems",
-                "orderAddress",
-                "orderNote",
-                "orderTax",
-                "orderBoxes",
-                "metafields",
-            )
-            used = set()
-            for section in preferred_sections:
-                if section in payload:
-                    used.add(section)
-                    _append_section(
-                        story,
-                        section,
-                        payload[section],
-                        body_style=body_style,
-                        heading_style=heading_style,
-                        font=font,
-                    )
-            for section, value in payload.items():
-                if section in used:
-                    continue
-                _append_section(
-                    story,
-                    section,
-                    value,
-                    body_style=body_style,
-                    heading_style=heading_style,
-                    font=font,
-                )
-            is_last_order = (
-                group_index == len(groups) - 1
-                and row_index == len(rows) - 1
-            )
+                if all(_shown(value) for value in (length, width, height)):
+                    dimensions.append(f"{length} x {width} x {height}")
+            delivery = _info_table([
+                ("Tracking Status", tracking_status),
+                ("Tracking Number", _pick(summary, "carrierTrackingNo", "trackingNo", default=_pick(order, "carrierTrackingNo", "trackingNo"))),
+                ("Carrier", _pick(summary, "carrierName", default=_pick(order, "carrierName"))),
+                ("Weight", _pick(order, "weight")),
+                ("Package Size", "; ".join(dimensions)),
+                ("Packages", len(boxes) if boxes else None),
+            ], body_style=body_style, font=font)
+            if delivery:
+                story.extend([_section_heading("Delivery & Package", heading_style), delivery])
+
+            note_data = payload.get("orderNote") or payload.get("OrderNote") or {}
+            note = _pick(note_data, "note") if isinstance(note_data, dict) else note_data
+            notes = _info_table([
+                ("Description", _pick(order, "description")),
+                ("Remarks", _pick(order, "remarks")),
+                ("Order Note", note),
+            ], body_style=body_style, font=font)
+            if notes:
+                story.extend([_section_heading("Notes", heading_style), notes])
+
+            is_last_order = group_index == len(groups) - 1 and row_index == len(rows) - 1
             if not is_last_order:
                 story.append(PageBreak())
 
-    document.build(story)
+    def add_footer(canvas, doc):
+        canvas.saveState()
+        canvas.setFont(font, 7)
+        canvas.setFillColor(colors.HexColor("#777A83"))
+        canvas.drawString(15 * mm, 8 * mm, "Shipra - Confidential Order Report")
+        canvas.drawRightString(195 * mm, 8 * mm, f"Page {doc.page}")
+        canvas.restoreState()
+
+    document.build(story, onFirstPage=add_footer, onLaterPages=add_footer)
     return buffer.getvalue()
 
 
