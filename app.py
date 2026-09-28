@@ -22,7 +22,7 @@ except ImportError:
 from live_api_executor import execute_live_intent
 from live_api_intent import parse_live_api_intent
 from live_response_formatter import format_live_result
-from order_pdf import build_orders_pdf, build_summary_pdf, safe_pdf_filename
+from order_pdf import build_orders_pdf, safe_pdf_filename
 from shipra_api import (
     ShipraAPI,
     ShipraAPIError,
@@ -897,13 +897,52 @@ def _remember_order_export(
     }
 
 
-def _remember_order_detail_export(summary: str, reference: str):
+def _remember_order_detail_export(
+    summary: str,
+    reference: str,
+    payload: dict,
+):
     st.session_state.pop("order_pdf", None)
     st.session_state.last_order_export = {
         "mode": "detail",
         "summary": summary,
         "reference": reference,
+        "payload": payload,
     }
+
+
+def _full_order_details(
+    api: ShipraAPI,
+    rows: list[dict],
+) -> list[dict]:
+    """Fetch and verify the complete API detail for every listed order."""
+    detailed_rows = []
+    for row in rows:
+        order_id = row.get("OrderId", row.get("orderId"))
+        if not order_id:
+            raise ShipraAPIError(
+                "An order has no OrderId, so its complete PDF details cannot be verified."
+            )
+
+        payload, updated_auth = api.order_by_id(str(order_id))
+        st.session_state.shipra_auth = updated_auth
+        result = payload.get("result", payload)
+        if not isinstance(result, dict):
+            raise ShipraAPIError(
+                f"Order {order_id} returned an invalid detail response."
+            )
+        order = result.get("order") or result.get("Order") or result
+        detail_id = (
+            order.get("orderId", order.get("OrderId"))
+            if isinstance(order, dict)
+            else None
+        )
+        if not detail_id or str(detail_id).lower() != str(order_id).lower():
+            raise ShipraAPIError(
+                f"Order-detail verification failed for {order_id}."
+            )
+        detailed_rows.append({"details": payload})
+    return detailed_rows
 
 
 def _fetch_pdf_orders(
@@ -996,9 +1035,13 @@ def structured_order_pdf_answer(question: str, history=None) -> str | None:
 
     if context.get("mode") == "detail":
         reference = str(context.get("reference") or "order")
-        pdf_bytes = build_summary_pdf(
+        payload = context.get("payload")
+        if not isinstance(payload, dict):
+            return "Order ki complete detail available nahi hai. Order dobara search karke PDF banayein."
+        pdf_bytes = build_orders_pdf(
+            [{"name": "Order detail", "rows": [{"details": payload}]}],
             title=f"Shipra Order {reference}",
-            summary=str(context.get("summary") or ""),
+            filter_text=f"Exact order reference: {reference}",
         )
         st.session_state.order_pdf = {
             "bytes": pdf_bytes,
@@ -1028,7 +1071,7 @@ def structured_order_pdf_answer(question: str, history=None) -> str | None:
                     groups.append(
                         {
                             "name": str(store["storeName"]),
-                            "rows": rows,
+                            "rows": _full_order_details(api, rows),
                         }
                     )
         else:
@@ -1045,7 +1088,7 @@ def structured_order_pdf_answer(question: str, history=None) -> str | None:
                         or context.get("channel_name")
                         or "All stores"
                     ),
-                    "rows": rows,
+                    "rows": _full_order_details(api, rows),
                 }
             )
 
@@ -1322,6 +1365,7 @@ def structured_live_answer(question: str, history) -> str | None:
             _remember_order_detail_export(
                 detail_summary,
                 intent.order_reference,
+                payload,
             )
             return detail_summary
         if intent.operation == "list":
@@ -1699,10 +1743,11 @@ if export_context and not pdf_file:
         "Create PDF for this result",
         use_container_width=True,
     ):
-        response = structured_order_pdf_answer(
-            "iski PDF file bana do",
-            st.session_state.history,
-        )
+        with st.spinner("Fetching and verifying complete order details..."):
+            response = structured_order_pdf_answer(
+                "iski PDF file bana do",
+                st.session_state.history,
+            )
         st.session_state.history.append(
             {"role": "assistant", "content": response}
         )
