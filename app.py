@@ -941,7 +941,7 @@ def _full_order_details(
             raise ShipraAPIError(
                 f"Order-detail verification failed for {order_id}."
             )
-        detailed_rows.append({"details": payload})
+        detailed_rows.append({"summary": row, "details": payload})
     return detailed_rows
 
 
