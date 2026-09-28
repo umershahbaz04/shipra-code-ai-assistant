@@ -173,3 +173,46 @@ def build_orders_pdf(
 
     document.build(story)
     return buffer.getvalue()
+
+
+def build_summary_pdf(*, title: str, summary: str) -> bytes:
+    """Create a PDF containing the exact privacy-safe order summary shown in chat."""
+    buffer = BytesIO()
+    font = _font_name()
+    styles = getSampleStyleSheet()
+    title_style = ParagraphStyle(
+        "ShipraSummaryTitle",
+        parent=styles["Title"],
+        fontName=font,
+        fontSize=18,
+        leading=22,
+        alignment=TA_CENTER,
+        spaceAfter=10,
+    )
+    body_style = ParagraphStyle(
+        "ShipraSummaryBody",
+        parent=styles["BodyText"],
+        fontName=font,
+        fontSize=10,
+        leading=15,
+        spaceAfter=5,
+    )
+    document = SimpleDocTemplate(
+        buffer,
+        pagesize=A4,
+        rightMargin=18 * mm,
+        leftMargin=18 * mm,
+        topMargin=18 * mm,
+        bottomMargin=18 * mm,
+        title=title,
+        author="Shipra AI Assistant",
+    )
+    story = [Paragraph(escape(title), title_style)]
+    for line in summary.splitlines():
+        clean = line.strip().replace("**", "")
+        if clean:
+            story.append(Paragraph(escape(clean), body_style))
+        else:
+            story.append(Spacer(1, 2 * mm))
+    document.build(story)
+    return buffer.getvalue()
