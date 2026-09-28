@@ -22,6 +22,7 @@ except ImportError:
 from live_api_executor import execute_live_intent
 from live_api_intent import parse_live_api_intent
 from live_response_formatter import format_live_result
+from order_excel import build_orders_excel, safe_excel_filename
 from order_pdf import build_orders_pdf, safe_pdf_filename
 from shipra_api import (
     ShipraAPI,
@@ -855,6 +856,8 @@ def _validate_order_source(data, store_id=None, channel_ids=None):
 
 def _is_order_pdf_request(question: str) -> bool:
     text = " ".join(question.lower().strip().split())
+    if re.search(r"\b(excel|xlsx|spreadsheet|sheet)\b", text):
+        return False
     has_file_word = bool(re.search(r"\b(pdf|file|document|report)\b", text))
     has_create_word = bool(
         re.search(
@@ -864,6 +867,21 @@ def _is_order_pdf_request(question: str) -> bool:
         )
     )
     return has_file_word and has_create_word
+
+
+def _is_order_excel_request(question: str) -> bool:
+    text = " ".join(question.lower().strip().split())
+    has_excel_word = bool(
+        re.search(r"\b(excel|xlsx|spreadsheet|sheet)\b", text)
+    )
+    has_create_word = bool(
+        re.search(
+            r"\b(make|create|generate|download|bana(?:o|do|dena)?|"
+            r"banado|nikal(?:o|do)|de\s*do|chahiye|chiaye)\b",
+            text,
+        )
+    )
+    return has_excel_word and has_create_word
 
 
 def _explicit_date_filter(question: str) -> bool:
@@ -990,6 +1008,7 @@ def _remember_order_export(
     expected_count=None,
 ):
     st.session_state.pop("order_pdf", None)
+    st.session_state.pop("order_excel", None)
     st.session_state.last_order_export = {
         "mode": "orders",
         "intent": intent,
@@ -1018,6 +1037,7 @@ def _remember_order_detail_export(
     payload: dict,
 ):
     st.session_state.pop("order_pdf", None)
+    st.session_state.pop("order_excel", None)
     st.session_state.last_order_export = {
         "mode": "detail",
         "summary": summary,
@@ -1036,7 +1056,7 @@ def _full_order_details(
         order_id = row.get("OrderId", row.get("orderId"))
         if not order_id:
             raise ShipraAPIError(
-                "An order has no OrderId, so its complete PDF details cannot be verified."
+                "An order has no OrderId, so its complete export details cannot be verified."
             )
 
         payload, updated_auth = api.order_by_id(str(order_id))
@@ -1060,7 +1080,7 @@ def _full_order_details(
     return detailed_rows
 
 
-def _fetch_pdf_orders(
+def _fetch_export_orders(
     api: ShipraAPI,
     context: dict,
     *,
@@ -1106,11 +1126,11 @@ def _fetch_pdf_orders(
             ):
                 raise ShipraAPIError(
                     "The filtered order count changed after the answer was shown. "
-                    "Run the order query again before creating its PDF."
+                    "Run the order query again before creating its export."
                 )
         elif page_total != expected_total:
             raise ShipraAPIError(
-                "Order data changed while the PDF was being created. Please retry."
+                "Order data changed while the export was being created. Please retry."
             )
 
         rows.extend(page_rows)
@@ -1120,9 +1140,56 @@ def _fetch_pdf_orders(
 
     if expected_total is not None and len(rows) != expected_total:
         raise ShipraAPIError(
-            "The complete filtered order list could not be verified, so no PDF was created."
+            "The complete filtered order list could not be verified, so no export was created."
         )
     return rows
+
+
+def _build_order_export_groups(api: ShipraAPI, context: dict) -> tuple[list[dict], int]:
+    stores = context.get("stores") or []
+    groups = []
+
+    if stores:
+        for store in stores:
+            rows = _fetch_export_orders(
+                api,
+                context,
+                store_id=int(store["storeId"]),
+                expected_count=store.get("orderCount"),
+            )
+            if rows:
+                groups.append(
+                    {
+                        "name": str(store["storeName"]),
+                        "rows": _full_order_details(api, rows),
+                    }
+                )
+    else:
+        rows = _fetch_export_orders(
+            api,
+            context,
+            store_id=context.get("store_id"),
+            expected_count=context.get("expected_count"),
+        )
+        groups.append(
+            {
+                "name": (
+                    context.get("store_name")
+                    or context.get("channel_name")
+                    or "All stores"
+                ),
+                "rows": _full_order_details(api, rows),
+            }
+        )
+
+    total = sum(len(group["rows"]) for group in groups)
+    expected_count = context.get("expected_count")
+    if expected_count is not None and total != int(expected_count):
+        raise ShipraAPIError(
+            "The export result does not match the count shown in chat. "
+            "No file was created."
+        )
+    return groups, total
 
 
 def structured_order_pdf_answer(question: str, history=None) -> str | None:
@@ -1171,49 +1238,8 @@ def structured_order_pdf_answer(question: str, history=None) -> str | None:
 
     try:
         api = ShipraAPI(shipra_base_url(), auth=auth)
-        stores = context.get("stores") or []
-        groups = []
-
-        if stores:
-            for store in stores:
-                rows = _fetch_pdf_orders(
-                    api,
-                    context,
-                    store_id=int(store["storeId"]),
-                    expected_count=store.get("orderCount"),
-                )
-                if rows:
-                    groups.append(
-                        {
-                            "name": str(store["storeName"]),
-                            "rows": _full_order_details(api, rows),
-                        }
-                    )
-        else:
-            rows = _fetch_pdf_orders(
-                api,
-                context,
-                store_id=context.get("store_id"),
-                expected_count=context.get("expected_count"),
-            )
-            groups.append(
-                {
-                    "name": (
-                        context.get("store_name")
-                        or context.get("channel_name")
-                        or "All stores"
-                    ),
-                    "rows": _full_order_details(api, rows),
-                }
-            )
-
+        groups, total = _build_order_export_groups(api, context)
         intent = context["intent"]
-        total = sum(len(group["rows"]) for group in groups)
-        expected_count = context.get("expected_count")
-        if expected_count is not None and total != int(expected_count):
-            raise ShipraAPIError(
-                "The PDF result does not match the count shown in chat. No PDF was created."
-            )
         label = _status_label(intent.status, intent.payment_status, total)
         scope = _date_scope(
             context.get("from_date"),
@@ -1238,6 +1264,90 @@ def structured_order_pdf_answer(question: str, history=None) -> str | None:
     except (ShipraAPIError, ValueError) as exc:
         st.session_state.pop("order_pdf", None)
         return f"PDF safely create nahi hui: `{exc}`"
+
+
+def structured_order_excel_answer(question: str, history=None) -> str | None:
+    if not _is_order_excel_request(question):
+        return None
+
+    context = st.session_state.get("last_order_export")
+    if not context and re.search(
+        r"\b(order|orders|parcel|shipment)\b|آرڈر|طلب",
+        question,
+        re.IGNORECASE,
+    ):
+        source_response = structured_live_answer(
+            question,
+            history or st.session_state.get("history", []),
+        )
+        context = st.session_state.get("last_order_export")
+        if not context:
+            return source_response
+
+    if not context:
+        return (
+            "Pehle required orders nikalwain, phir "
+            "`iski Excel file bana do` likhein."
+        )
+
+    if context.get("mode") == "detail":
+        reference = str(context.get("reference") or "order")
+        payload = context.get("payload")
+        if not isinstance(payload, dict):
+            return (
+                "Order ki complete detail available nahi hai. "
+                "Order dobara search karke Excel banayein."
+            )
+        excel_bytes = build_orders_excel(
+            [{"name": "Order detail", "rows": [{"details": payload}]}],
+            title=f"Shipra Order {reference}",
+            filter_text=f"Exact order reference: {reference}",
+        )
+        st.session_state.order_excel = {
+            "bytes": excel_bytes,
+            "name": safe_excel_filename(f"shipra_order_{reference}"),
+            "count": 1,
+        }
+        return (
+            "Isi order detail ki Excel file tayar hai. "
+            "Neeche Download Excel button use karein."
+        )
+
+    auth = st.session_state.get("shipra_auth")
+    if not auth:
+        return (
+            "Excel banane ke liye pehle sidebar se "
+            "Shipra account connect karein."
+        )
+
+    try:
+        api = ShipraAPI(shipra_base_url(), auth=auth)
+        groups, total = _build_order_export_groups(api, context)
+        intent = context["intent"]
+        label = _status_label(intent.status, intent.payment_status, total)
+        scope = _date_scope(
+            context.get("from_date"),
+            context.get("to_date"),
+            "English",
+        )
+        excel_bytes = build_orders_excel(
+            groups,
+            title=f"Shipra {label.title()}",
+            filter_text=f"{label} | {scope}",
+        )
+        st.session_state.order_excel = {
+            "bytes": excel_bytes,
+            "name": safe_excel_filename(f"shipra_{label}_{scope}"),
+            "count": total,
+        }
+        return (
+            f"Excel file tayar hai. Is mein wahi filter use hua hai aur "
+            f"**{total} verified {label}** shamil hain. "
+            "Neeche Download Excel button use karein."
+        )
+    except (ShipraAPIError, ValueError) as exc:
+        st.session_state.pop("order_excel", None)
+        return f"Excel safely create nahi hui: `{exc}`"
 
 def structured_live_answer(question: str, history) -> str | None:
     text = " ".join(question.lower().strip().split())
@@ -1796,6 +1906,7 @@ with st.sidebar:
         st.session_state.pop("last_order_context", None)
         st.session_state.pop("last_order_export", None)
         st.session_state.pop("order_pdf", None)
+        st.session_state.pop("order_excel", None)
         st.rerun()
     st.caption("Code answers use the indexed source snapshot.")
     st.divider()
@@ -1808,6 +1919,7 @@ with st.sidebar:
             st.session_state.pop("last_order_context", None)
             st.session_state.pop("last_order_export", None)
             st.session_state.pop("order_pdf", None)
+            st.session_state.pop("order_excel", None)
             st.rerun()
     else:
         with st.form("shipra_login", clear_on_submit=True):
@@ -1877,31 +1989,65 @@ if page_state:
             st.rerun()
 
 pdf_file = st.session_state.get("order_pdf")
+excel_file = st.session_state.get("order_excel")
 export_context = st.session_state.get("last_order_export")
-if export_context and not pdf_file:
-    if st.button(
-        "Create PDF for this result",
-        use_container_width=True,
-    ):
-        with st.spinner("Fetching and verifying complete order details..."):
-            response = structured_order_pdf_answer(
-                "iski PDF file bana do",
-                st.session_state.history,
+if export_context:
+    pdf_column, excel_column = st.columns(2)
+    with pdf_column:
+        if not pdf_file and st.button(
+            "Create PDF for this result",
+            use_container_width=True,
+        ):
+            with st.spinner("Fetching and verifying complete order details..."):
+                response = structured_order_pdf_answer(
+                    "iski PDF file bana do",
+                    st.session_state.history,
+                )
+            st.session_state.history.append(
+                {"role": "assistant", "content": response}
             )
-        st.session_state.history.append(
-            {"role": "assistant", "content": response}
-        )
-        st.session_state.scroll_to_latest = True
-        st.rerun()
+            st.session_state.scroll_to_latest = True
+            st.rerun()
 
-if pdf_file:
-    st.download_button(
-        "Download PDF",
-        data=pdf_file["bytes"],
-        file_name=pdf_file["name"],
-        mime="application/pdf",
-        use_container_width=True,
-    )
+    with excel_column:
+        if not excel_file and st.button(
+            "Create Excel for this result",
+            use_container_width=True,
+        ):
+            with st.spinner("Fetching and verifying complete order details..."):
+                response = structured_order_excel_answer(
+                    "iski Excel file bana do",
+                    st.session_state.history,
+                )
+            st.session_state.history.append(
+                {"role": "assistant", "content": response}
+            )
+            st.session_state.scroll_to_latest = True
+            st.rerun()
+
+if pdf_file or excel_file:
+    pdf_download, excel_download = st.columns(2)
+    with pdf_download:
+        if pdf_file:
+            st.download_button(
+                "Download PDF",
+                data=pdf_file["bytes"],
+                file_name=pdf_file["name"],
+                mime="application/pdf",
+                use_container_width=True,
+            )
+    with excel_download:
+        if excel_file:
+            st.download_button(
+                "Download Excel",
+                data=excel_file["bytes"],
+                file_name=excel_file["name"],
+                mime=(
+                    "application/vnd.openxmlformats-officedocument."
+                    "spreadsheetml.sheet"
+                ),
+                use_container_width=True,
+            )
 
 if st.session_state.pop("scroll_to_latest", False):
     components.html(
@@ -1948,8 +2094,11 @@ if q := st.chat_input("Ask about Shipra code..."):
         "pichla page",
     }
     is_pdf_request = _is_order_pdf_request(q)
-    if not is_pdf_request:
+    is_excel_request = _is_order_excel_request(q)
+    is_export_request = is_pdf_request or is_excel_request
+    if not is_export_request:
         st.session_state.pop("order_pdf", None)
+        st.session_state.pop("order_excel", None)
         st.session_state.pop("last_order_export", None)
 
     if " ".join(q.lower().strip().split()) not in navigation_words:
@@ -1964,7 +2113,12 @@ if q := st.chat_input("Ask about Shipra code..."):
                 is_navigation = " ".join(q.lower().strip().split()) in navigation_words
 
                 # Clarification aur page navigation ko existing order state handle karegi.
-                if is_pdf_request:
+                if is_excel_request:
+                    out = structured_order_excel_answer(
+                        q,
+                        st.session_state.history,
+                    )
+                elif is_pdf_request:
                     out = structured_order_pdf_answer(
                         q,
                         st.session_state.history,
