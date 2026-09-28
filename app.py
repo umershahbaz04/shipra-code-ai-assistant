@@ -564,18 +564,18 @@ def _format_store_order_counts(
 def _store_order_extreme(question: str) -> str | None:
     """Return least/most only for explicit store-order comparison questions."""
     text = " ".join(question.lower().strip().split())
-    has_store = bool(re.search(r"\b(store|stores|stor)\b|سٹور|متجر", text))
+    has_store = bool(re.search(r"\b(store|stores|stor)\b|سٹور|متجر|متاجر", text))
     has_orders = bool(re.search(r"\b(order|orders|parcel|shipment)\b|آرڈر|طلب", text))
     if not (has_store and has_orders):
         return None
     if re.search(
-        r"\b(fewest|least|lowest|minimum|min)\b|"
+        r"\b(fewest|lowest|minimum|min)\b|(?<!at )\bleast\b|"
         r"\b(sab|sary|sare)\s+(?:se|sy)\s+kam\b",
         text,
     ):
         return "least"
     if re.search(
-        r"\b(most|highest|maximum|max)\b|"
+        r"\b(highest|maximum|max)\b|(?<!at )\bmost\b|"
         r"\b(sab|sary|sare)\s+(?:se|sy)\s+(?:zyada|ziada|zayada)\b",
         text,
     ):
@@ -608,6 +608,194 @@ def _format_store_extreme(data: dict, extreme: str, language: str) -> str:
         return f"According to the live Shipra API, **{names}** has the {direction} orders: **{target_count}**."
     direction = "sab se kam" if extreme == "least" else "sab se zyada"
     return f"Live Shipra API ke mutabiq **{names}** ke {direction} orders hain: **{target_count} orders**."
+
+def _parse_store_analytics(question: str) -> dict | None:
+    """Parse common store-order comparisons without relying on LLM wording."""
+    text = " ".join(question.lower().strip().split())
+    has_store = bool(re.search(r"\b(store|stores|stor)\b|سٹور|متجر|متاجر", text))
+    has_orders = bool(re.search(r"\b(order|orders|parcel|shipment)\b|آرڈر|طلب", text))
+    if not (has_store and has_orders):
+        return None
+
+    numbers = [int(value) for value in re.findall(r"\b\d+\b", text)]
+    top_match = re.search(r"\b(top|bottom)\s+(\d+)\s+stores?\b", text)
+    if top_match:
+        return {
+            "kind": "rank",
+            "direction": "most" if top_match.group(1) == "top" else "least",
+            "limit": int(top_match.group(2)),
+        }
+    if re.search(
+        r"\b(fewest|lowest|minimum|min)\b|(?<!at )\bleast\b|"
+        r"\b(sab|sary|sare)\s+(?:se|sy)\s+kam\b",
+        text,
+    ):
+        return {"kind": "rank", "direction": "least", "limit": 1}
+    if re.search(
+        r"\b(highest|maximum|max)\b|(?<!at )\bmost\b|"
+        r"\b(sab|sary|sare)\s+(?:se|sy)\s+(?:zyada|ziada|zayada)\b",
+        text,
+    ):
+        return {"kind": "rank", "direction": "most", "limit": 1}
+
+    between = re.search(
+        r"\bbetween\s+(\d+)\s+(?:and|to)\s+(\d+)\b|"
+        r"\b(\d+)\s+(?:se|sy)\s+(\d+)\s+(?:tak|darmiyan)\b|"
+        r"بين\s+(\d+)\s+و\s*(\d+)",
+        text,
+    )
+    if between:
+        values = [int(value) for value in between.groups() if value is not None]
+        low, high = sorted(values[:2])
+        return {"kind": "range", "low": low, "high": high}
+
+    if not numbers:
+        if re.search(
+            r"\b(by store|store[- ]?wise|each store|every store|har store|"
+            r"kis store ke kitn)\b",
+            text,
+        ):
+            return {"kind": "breakdown"}
+        return None
+
+    value = numbers[-1]
+    has_less = bool(re.search(r"\b(less|fewer|under|below|kam)\b|أقل|اقل", text))
+    has_more = bool(re.search(r"\b(more|over|above|greater|zyada|ziada|zayada)\b|أكثر|اكثر", text))
+    inclusive = bool(
+        re.search(
+            r"<=|>=|\b(at most|up to|not more than|or less|or fewer|"
+            r"at least|not less than|or more|ya|barabar)\b|"
+            r"أو أقل|او اقل|أو أكثر|او اكثر|على الأكثر|على الاكثر|على الأقل|على الاقل",
+            text,
+        )
+    )
+    if has_less and has_more:
+        return {"kind": "ambiguous"}
+    if re.search(r"\b(at most|up to|not more than)\b|على الأكثر|على الاكثر", text):
+        return {"kind": "threshold", "operator": "lte", "value": value}
+    if re.search(r"\b(at least|not less than)\b|على الأقل|على الاقل", text):
+        return {"kind": "threshold", "operator": "gte", "value": value}
+    if "<=" in text or (has_less and inclusive):
+        return {"kind": "threshold", "operator": "lte", "value": value}
+    if ">=" in text or (has_more and inclusive):
+        return {"kind": "threshold", "operator": "gte", "value": value}
+    if "<" in text or has_less:
+        return {"kind": "threshold", "operator": "lt", "value": value}
+    if ">" in text or has_more:
+        return {"kind": "threshold", "operator": "gt", "value": value}
+    if re.search(r"==|\b(exactly|equal|equals|barabar)\b", text) or re.search(
+        r"\b\d+\s+(?:orders?|orderon)\b",
+        text,
+    ):
+        return {"kind": "threshold", "operator": "eq", "value": value}
+    return None
+
+
+def _select_store_analytics(stores: list[dict], analytics: dict) -> list[dict]:
+    stores = sorted(
+        stores,
+        key=lambda store: (
+            int(store.get("orderCount") or 0),
+            str(store.get("storeName") or "").lower(),
+        ),
+    )
+    kind = analytics["kind"]
+    if kind == "breakdown":
+        return stores
+    if kind == "range":
+        return [
+            store
+            for store in stores
+            if analytics["low"]
+            <= int(store.get("orderCount") or 0)
+            <= analytics["high"]
+        ]
+    if kind == "threshold":
+        value = analytics["value"]
+        checks = {
+            "lt": lambda count: count < value,
+            "lte": lambda count: count <= value,
+            "eq": lambda count: count == value,
+            "gte": lambda count: count >= value,
+            "gt": lambda count: count > value,
+        }
+        return [
+            store
+            for store in stores
+            if checks[analytics["operator"]](int(store.get("orderCount") or 0))
+        ]
+
+    descending = analytics["direction"] == "most"
+    ranked = sorted(
+        stores,
+        key=lambda store: int(store.get("orderCount") or 0),
+        reverse=descending,
+    )
+    limit = max(int(analytics.get("limit") or 1), 1)
+    if len(ranked) <= limit:
+        return ranked
+    cutoff = int(ranked[limit - 1].get("orderCount") or 0)
+    return [
+        store
+        for store in ranked
+        if (
+            int(store.get("orderCount") or 0) >= cutoff
+            if descending
+            else int(store.get("orderCount") or 0) <= cutoff
+        )
+    ]
+
+
+def _store_analytics_label(analytics: dict, language: str) -> str:
+    if analytics["kind"] == "range":
+        if language == "Arabic":
+            return f"من {analytics['low']} إلى {analytics['high']}"
+        return f"{analytics['low']} se {analytics['high']} tak"
+    if analytics["kind"] == "threshold":
+        value = analytics["value"]
+        labels = {
+            "lt": (f"fewer than {value}", f"{value} se kam"),
+            "lte": (f"{value} or fewer", f"{value} ya us se kam"),
+            "eq": (f"exactly {value}", f"exactly {value}"),
+            "gte": (f"{value} or more", f"{value} ya us se zyada"),
+            "gt": (f"more than {value}", f"{value} se zyada"),
+        }
+        if language == "Arabic":
+            arabic = {
+                "lt": f"أقل من {value}",
+                "lte": f"{value} أو أقل",
+                "eq": f"{value} بالضبط",
+                "gte": f"{value} أو أكثر",
+                "gt": f"أكثر من {value}",
+            }
+            return arabic[analytics["operator"]]
+        return labels[analytics["operator"]][0 if language == "English" else 1]
+    if analytics["kind"] == "rank":
+        return "most" if analytics["direction"] == "most" else "least"
+    return "store-wise"
+
+
+def _format_store_analytics(matches: list[dict], analytics: dict, language: str) -> str:
+    label = _store_analytics_label(analytics, language)
+    if not matches:
+        if language == "Arabic":
+            return f"لا يوجد متجر في Shipra لديه طلبات بعدد {label}."
+        if language == "English":
+            return f"No Shipra store has {label} orders."
+        return f"Live Shipra API ke mutabiq kisi store ke {label} orders nahi hain."
+    if language == "Arabic":
+        lines = [f"متاجر Shipra التي لديها طلبات بعدد {label}: **{len(matches)}**"]
+    elif language == "English":
+        lines = [f"Shipra stores with {label} orders: **{len(matches)}**"]
+    else:
+        lines = [f"Live Shipra API ke mutabiq **{len(matches)} stores** ke {label} orders hain:"]
+    for index, store in enumerate(matches, 1):
+        lines.append(
+            f"{index}. {store.get('storeName') or 'Unknown store'}: "
+            f"**{int(store.get('orderCount') or 0)} orders**"
+        )
+    return "\n".join(lines)
+
 
 def _validated_live_result(data, intent: OrderIntent):
     expected_ids = STATUS_IDS[intent.status]
@@ -898,7 +1086,7 @@ def structured_live_answer(question: str, history) -> str | None:
     original_question = question
     if history and history[-1].get("role") == "user":
         original_question = str(history[-1].get("content") or question)
-    store_extreme = _store_order_extreme(
+    store_analytics = _parse_store_analytics(
         f"{question} {original_question}"
     )
 
@@ -941,10 +1129,30 @@ def structured_live_answer(question: str, history) -> str | None:
         try:
             intent = parse_order_intent(st.secrets["GROQ_API_KEY"], question, history[:-1])
         except Exception:
-            likely_order = bool(re.search(r"order|parcel|shipment|payment|paid|unpaid|progress|return|آرڈر|طلب", question, re.IGNORECASE))
-            if pending_intent or likely_order:
-                return "Order request parser is temporarily unavailable. No Shipra API call was made; please retry shortly."
-            return None
+            has_extra_filters = bool(
+                re.search(
+                    r"\b(today|aaj|aj|yesterday|kal|last|past|akhri|"
+                    r"delivered|pending|progress|returned|refunded|cancelled|"
+                    r"transit|paid|unpaid|payment)\b",
+                    original_question,
+                    re.IGNORECASE,
+                )
+            )
+            if store_analytics and not has_extra_filters:
+                intent = OrderIntent(
+                    is_order_query=True,
+                    operation="count",
+                    status="all",
+                    date_mode="all_time",
+                    language=response_language(original_question),
+                    confidence=1.0,
+                    group_by="store",
+                )
+            else:
+                likely_order = bool(re.search(r"order|parcel|shipment|payment|paid|unpaid|progress|return|آرڈر|طلب", question, re.IGNORECASE))
+                if pending_intent or likely_order:
+                    return "Order request parser is temporarily unavailable. No Shipra API call was made; please retry shortly."
+                return None
     if not intent.is_order_query:
         st.session_state.pop("pending_order_intent", None)
         st.session_state.pop("pending_order_question", None)
@@ -991,7 +1199,7 @@ def structured_live_answer(question: str, history) -> str | None:
         if (
             selected_store_id is None
             and text not in next_words | previous_words
-            and store_extreme is None
+            and store_analytics is None
         ):
             selected_store, updated_auth = _resolve_store(api, store_question)
             st.session_state.shipra_auth = updated_auth
@@ -1022,10 +1230,15 @@ def structured_live_answer(question: str, history) -> str | None:
             return f"Live Shipra API ke mutabiq **{selected_channel_name} ke 0 orders** hain."
 
         if (
-            store_extreme
+            store_analytics
             and selected_store_id is None
             and selected_channel_name is None
         ):
+            if store_analytics["kind"] == "ambiguous":
+                return (
+                    "Store-order comparison clear nahi hai. Misal ke taur par "
+                    "`10 ya us se kam`, `10 se zyada`, ya `5 se 10 tak` likhein."
+                )
             data, updated_auth = api.count_orders_by_store(
                 from_date=from_date,
                 to_date=to_date,
@@ -1037,16 +1250,10 @@ def structured_live_answer(question: str, history) -> str | None:
             stores = data.get("stores") or []
             if not stores:
                 return "Live Shipra API mein koi store-order data nahi mila."
-            target_count = (
-                min(int(store.get("orderCount") or 0) for store in stores)
-                if store_extreme == "least"
-                else max(int(store.get("orderCount") or 0) for store in stores)
+            target_stores = _select_store_analytics(
+                stores,
+                store_analytics,
             )
-            target_stores = [
-                store
-                for store in stores
-                if int(store.get("orderCount") or 0) == target_count
-            ]
             _remember_order_export(
                 intent,
                 from_date,
@@ -1057,9 +1264,9 @@ def structured_live_answer(question: str, history) -> str | None:
                     for store in target_stores
                 ),
             )
-            return _format_store_extreme(
-                data,
-                store_extreme,
+            return _format_store_analytics(
+                target_stores,
+                store_analytics,
                 response_language(original_question),
             )
 
