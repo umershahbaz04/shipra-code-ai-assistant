@@ -22,6 +22,7 @@ except ImportError:
 from live_api_executor import execute_live_intent
 from live_api_intent import parse_live_api_intent
 from live_response_formatter import format_live_result
+from order_pdf import build_orders_pdf, safe_pdf_filename
 from shipra_api import (
     ShipraAPI,
     ShipraAPIError,
@@ -614,6 +615,185 @@ def _validate_order_source(data, store_id=None, channel_ids=None):
                     "Shipra returned an order outside the selected sale channel. Result blocked."
                 )
 
+
+def _is_order_pdf_request(question: str) -> bool:
+    text = " ".join(question.lower().strip().split())
+    has_file_word = bool(re.search(r"\b(pdf|file|document|report)\b", text))
+    has_create_word = bool(
+        re.search(
+            r"\b(make|create|generate|download|bana(?:o|do|dena)?|"
+            r"banado|nikal(?:o|do)|de\s*do|chahiye|chiaye)\b",
+            text,
+        )
+    )
+    return has_file_word and has_create_word
+
+
+def _remember_order_export(
+    intent: OrderIntent,
+    from_date,
+    to_date,
+    *,
+    store_id=None,
+    store_name=None,
+    channel_ids=None,
+    channel_name=None,
+    stores=None,
+):
+    st.session_state.pop("order_pdf", None)
+    st.session_state.last_order_export = {
+        "intent": intent,
+        "from_date": from_date,
+        "to_date": to_date,
+        "store_id": store_id,
+        "store_name": store_name,
+        "channel_ids": list(channel_ids or []),
+        "channel_name": channel_name,
+        "stores": list(stores or []),
+    }
+
+
+def _fetch_pdf_orders(api: ShipraAPI, context: dict, *, store_id=None) -> list[dict]:
+    intent = context["intent"]
+    channel_ids = context.get("channel_ids") or []
+    rows: list[dict] = []
+    start = 0
+    expected_total = None
+
+    while expected_total is None or start < expected_total:
+        data, updated_auth = api.list_orders(
+            context.get("from_date"),
+            context.get("to_date"),
+            limit=100,
+            start=start,
+            carrier_tracking_status_ids=STATUS_IDS[intent.status],
+            payment_status_id=PAYMENT_STATUS_IDS[intent.payment_status],
+            store_ids=(str(store_id) if store_id is not None else None),
+            sale_channel_config_ids=(
+                ",".join(str(value) for value in channel_ids)
+                if channel_ids and store_id is None
+                else None
+            ),
+        )
+        st.session_state.shipra_auth = updated_auth
+        _validated_live_result(data, intent)
+        _validate_order_source(
+            data,
+            store_id=store_id,
+            channel_ids=(channel_ids if store_id is None else None),
+        )
+
+        page_rows = data.get("rows") or []
+        page_total = int(data.get("count") or 0)
+        if expected_total is None:
+            expected_total = page_total
+        elif page_total != expected_total:
+            raise ShipraAPIError(
+                "Order data changed while the PDF was being created. Please retry."
+            )
+
+        rows.extend(page_rows)
+        start += len(page_rows)
+        if not page_rows:
+            break
+
+    if expected_total is not None and len(rows) != expected_total:
+        raise ShipraAPIError(
+            "The complete filtered order list could not be verified, so no PDF was created."
+        )
+    return rows
+
+
+def structured_order_pdf_answer(question: str, history=None) -> str | None:
+    if not _is_order_pdf_request(question):
+        return None
+
+    context = st.session_state.get("last_order_export")
+    if not context and re.search(
+        r"\b(order|orders|parcel|shipment)\b|آرڈر|طلب",
+        question,
+        re.IGNORECASE,
+    ):
+        source_response = structured_live_answer(
+            question,
+            history or st.session_state.get("history", []),
+        )
+        context = st.session_state.get("last_order_export")
+        if not context:
+            return source_response
+
+    if not context:
+        return (
+            "Pehle required orders nikalwain, phir `iski PDF file bana do` likhein."
+        )
+
+    auth = st.session_state.get("shipra_auth")
+    if not auth:
+        return "PDF banane ke liye pehle sidebar se Shipra account connect karein."
+
+    try:
+        api = ShipraAPI(shipra_base_url(), auth=auth)
+        stores = context.get("stores") or []
+        groups = []
+
+        if stores:
+            for store in stores:
+                rows = _fetch_pdf_orders(
+                    api,
+                    context,
+                    store_id=int(store["storeId"]),
+                )
+                if rows:
+                    groups.append(
+                        {
+                            "name": str(store["storeName"]),
+                            "rows": rows,
+                        }
+                    )
+        else:
+            rows = _fetch_pdf_orders(
+                api,
+                context,
+                store_id=context.get("store_id"),
+            )
+            groups.append(
+                {
+                    "name": (
+                        context.get("store_name")
+                        or context.get("channel_name")
+                        or "All stores"
+                    ),
+                    "rows": rows,
+                }
+            )
+
+        intent = context["intent"]
+        total = sum(len(group["rows"]) for group in groups)
+        label = _status_label(intent.status, intent.payment_status, total)
+        scope = _date_scope(
+            context.get("from_date"),
+            context.get("to_date"),
+            "English",
+        )
+        title = f"Shipra {label.title()}"
+        pdf_bytes = build_orders_pdf(
+            groups,
+            title=title,
+            filter_text=f"{label} | {scope}",
+        )
+        st.session_state.order_pdf = {
+            "bytes": pdf_bytes,
+            "name": safe_pdf_filename(f"shipra_{label}_{scope}"),
+            "count": total,
+        }
+        return (
+            f"PDF tayar hai. Is mein wahi filter use hua hai aur "
+            f"**{total} verified {label}** shamil hain. Neeche Download PDF button use karein."
+        )
+    except (ShipraAPIError, ValueError) as exc:
+        st.session_state.pop("order_pdf", None)
+        return f"PDF safely create nahi hui: `{exc}`"
+
 def structured_live_answer(question: str, history) -> str | None:
     text = " ".join(question.lower().strip().split())
 
@@ -831,6 +1011,25 @@ def structured_live_answer(question: str, history) -> str | None:
                     "channel_name": None,
                     "grouped_pages": grouped_pages,
                 }
+                export_stores = []
+                seen_export_store_ids = set()
+                for item in grouped_pages:
+                    store_id = int(item["storeId"])
+                    if store_id in seen_export_store_ids:
+                        continue
+                    seen_export_store_ids.add(store_id)
+                    export_stores.append(
+                        {
+                            "storeId": store_id,
+                            "storeName": str(item["storeName"]),
+                        }
+                    )
+                _remember_order_export(
+                    intent,
+                    from_date,
+                    to_date,
+                    stores=export_stores,
+                )
                 store_count = current_store["orderCount"]
                 label = _status_label(intent.status, intent.payment_status, store_count)
                 result = f"### Store: {current_store['storeName']}\n\n"
@@ -883,6 +1082,15 @@ def structured_live_answer(question: str, history) -> str | None:
                 "channel_ids": selected_channel_ids,
                 "channel_name": selected_channel_name,
             }
+            _remember_order_export(
+                intent,
+                from_date,
+                to_date,
+                store_id=selected_store_id,
+                store_name=selected_store_name,
+                channel_ids=selected_channel_ids,
+                channel_name=selected_channel_name,
+            )
             label = _status_label(intent.status, intent.payment_status, total)
             source_name = selected_store_name or selected_channel_name
             if source_name:
@@ -1007,6 +1215,8 @@ with st.sidebar:
         st.session_state.pop("order_page", None)
         st.session_state.pop("pending_order_intent", None)
         st.session_state.pop("pending_order_question", None)
+        st.session_state.pop("last_order_export", None)
+        st.session_state.pop("order_pdf", None)
         st.rerun()
     st.caption("Code answers use the indexed source snapshot.")
     st.divider()
@@ -1083,6 +1293,16 @@ if page_state:
             st.session_state.scroll_to_latest = True
             st.rerun()
 
+pdf_file = st.session_state.get("order_pdf")
+if pdf_file:
+    st.download_button(
+        "Download PDF",
+        data=pdf_file["bytes"],
+        file_name=pdf_file["name"],
+        mime="application/pdf",
+        use_container_width=True,
+    )
+
 if st.session_state.pop("scroll_to_latest", False):
     components.html(
         """
@@ -1127,6 +1347,10 @@ if q := st.chat_input("Ask about Shipra code..."):
         "pichla",
         "pichla page",
     }
+    is_pdf_request = _is_order_pdf_request(q)
+    if not is_pdf_request:
+        st.session_state.pop("order_pdf", None)
+
     if " ".join(q.lower().strip().split()) not in navigation_words:
         st.session_state.pop("order_page", None)
 
@@ -1139,7 +1363,12 @@ if q := st.chat_input("Ask about Shipra code..."):
                 is_navigation = " ".join(q.lower().strip().split()) in navigation_words
 
                 # Clarification aur page navigation ko existing order state handle karegi.
-                if pending or is_navigation:
+                if is_pdf_request:
+                    out = structured_order_pdf_answer(
+                        q,
+                        st.session_state.history,
+                    )
+                elif pending or is_navigation:
                     out = structured_live_answer(q, st.session_state.history)
                 else:
                     try:
