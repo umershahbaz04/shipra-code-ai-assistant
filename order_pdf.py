@@ -9,7 +9,7 @@ from typing import Any
 
 from reportlab.lib import colors
 from reportlab.lib.enums import TA_CENTER, TA_RIGHT
-from reportlab.lib.pagesizes import A4
+from reportlab.lib.pagesizes import A4, landscape
 from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
 from reportlab.lib.units import mm
 from reportlab.pdfbase import pdfmetrics
@@ -215,51 +215,48 @@ def build_orders_pdf(
     title: str,
     filter_text: str,
 ) -> bytes:
-    """Create a concise professional order report from verified API data."""
+    """Create a compact Shopify-style table with one order per row."""
     buffer = BytesIO()
     font = _font_name()
     styles = getSampleStyleSheet()
-    brand_style = ParagraphStyle(
-        "ShipraBrand", parent=styles["Title"], fontName=font,
-        fontSize=20, leading=22, textColor=colors.HexColor("#563AD5"),
-    )
-    report_style = ParagraphStyle(
-        "ShipraReport", parent=styles["Heading2"], fontName=font,
-        fontSize=10, leading=12, textColor=colors.HexColor("#696D78"),
+    title_style = ParagraphStyle(
+        "ShipraListTitle", parent=styles["Title"], fontName=font,
+        fontSize=18, leading=22, textColor=colors.HexColor("#22242A"),
+        alignment=TA_CENTER, spaceAfter=5,
     )
     body_style = ParagraphStyle(
-        "ShipraBody", parent=styles["BodyText"], fontName=font,
-        fontSize=8.5, leading=11, wordWrap="CJK",
+        "ShipraListBody", parent=styles["BodyText"], fontName=font,
+        fontSize=6.5, leading=8, wordWrap="CJK",
     )
-    small_style = ParagraphStyle(
-        "ShipraSmall", parent=body_style, fontSize=7.2, leading=9,
+    meta_style = ParagraphStyle(
+        "ShipraListMeta", parent=body_style, fontSize=7.5, leading=10,
         textColor=colors.HexColor("#696D78"),
     )
-    order_no_style = ParagraphStyle(
-        "ShipraOrderNo", parent=styles["Heading1"], fontName=font,
-        fontSize=14, leading=17, alignment=TA_RIGHT,
-        textColor=colors.HexColor("#22242A"),
-    )
-    heading_style = ParagraphStyle(
-        "ShipraHeading", parent=styles["Heading2"], fontName=font,
-        fontSize=10.5, leading=13, textColor=colors.HexColor("#30226F"),
-        spaceBefore=7, spaceAfter=4,
-    )
     document = SimpleDocTemplate(
-        buffer, pagesize=A4, rightMargin=15 * mm, leftMargin=15 * mm,
-        topMargin=14 * mm, bottomMargin=14 * mm,
+        buffer, pagesize=landscape(A4), rightMargin=10 * mm, leftMargin=10 * mm,
+        topMargin=11 * mm, bottomMargin=12 * mm,
         title=title, author="Shipra AI Assistant",
     )
 
     total_orders = sum(len(group.get("rows") or []) for group in groups)
-    generated_at = datetime.now().strftime("%Y-%m-%d %H:%M")
-    story: list[Any] = []
-    order_number = 0
+    story: list[Any] = [
+        Paragraph(escape(title), title_style),
+        Paragraph(escape(filter_text), meta_style),
+        Paragraph(
+            escape(f"Generated {datetime.now().strftime('%Y-%m-%d %H:%M')} | Total orders: {total_orders}"),
+            meta_style,
+        ),
+        Spacer(1, 4 * mm),
+    ]
+    table_rows: list[list[Any]] = [[
+        "Order", "Date", "Customer", "Store / Channel", "Total",
+        "Payment", "Order Status", "Items", "Delivery / Carrier", "Tracking No",
+    ]]
 
-    for group_index, group in enumerate(groups):
+    order_number = 0
+    for group in groups:
         group_name = str(group.get("name") or "All stores")
-        rows = group.get("rows") or []
-        for row_index, row in enumerate(rows):
+        for row in group.get("rows") or []:
             order_number += 1
             payload = _order_payload(row)
             summary = row.get("summary") if isinstance(row, dict) else {}
@@ -269,120 +266,60 @@ def build_orders_pdf(
             address = payload.get("orderAddress") or payload.get("OrderAddress") or {}
             address = address if isinstance(address, dict) else {}
             items = payload.get("orderItems") or payload.get("OrderItems") or []
-            items = [item for item in items if isinstance(item, dict)] if isinstance(items, list) else []
-            boxes = payload.get("orderBoxes") or payload.get("OrderBoxes") or []
-            boxes = [box for box in boxes if isinstance(box, dict)] if isinstance(boxes, list) else []
-            reference = _order_reference(payload, order_number)
-
-            header = Table(
-                [[
-                    [Paragraph("SHIPRA", brand_style), Paragraph("ORDER REPORT", report_style)],
-                    Paragraph(f"Order #{escape(reference)}", order_no_style),
-                ]],
-                colWidths=[90 * mm, 90 * mm],
-            )
-            header.setStyle(TableStyle([
-                ("VALIGN", (0, 0), (-1, -1), "TOP"),
-                ("LINEBELOW", (0, 0), (-1, -1), 1.2, colors.HexColor("#563AD5")),
-                ("BOTTOMPADDING", (0, 0), (-1, -1), 7),
-            ]))
-            story.extend([
-                header,
-                Spacer(1, 2 * mm),
-                Paragraph(
-                    escape(f"{filter_text} | Order {order_number} of {total_orders} | Generated {generated_at}"),
-                    small_style,
-                ),
-            ])
+            items = items if isinstance(items, list) else []
 
             payment_id = _pick(order, "paymentStatusId")
-            payment_status = _pick(order, "paymentStatus", "paymentStatusName")
-            if not _shown(payment_status):
-                payment_status = {1: "Unpaid", 2: "Paid"}.get(payment_id)
-            tracking_status = _pick(
-                summary, "carrierTrackingStatus", "status",
-                default=_pick(order, "carrierTrackingStatus", "status"),
-            )
-            overview = _info_table([
-                ("Order Date", _format_date(_pick(order, "orderDate", default=_pick(summary, "orderDate")))),
-                ("Store", group_name),
-                ("Order Status", tracking_status),
-                ("Payment Status", payment_status),
-                ("Items", _pick(order, "itemsCount", default=len(items) or None)),
-                ("Sales Channel", _pick(summary, "saleChannelName", "channelName")),
-            ], body_style=body_style, font=font)
-            if overview:
-                story.extend([_section_heading("Order Overview", heading_style), overview])
+            payment = _pick(summary, "paymentStatus", default=_pick(order, "paymentStatus", "paymentStatusName"))
+            if not _shown(payment):
+                payment = {1: "Unpaid", 2: "Paid"}.get(payment_id, "-")
+            order_status = _pick(summary, "orderStatus", "status", default=_pick(order, "orderStatus", "status"))
+            delivery_status = _pick(summary, "carrierTrackingStatus", "deliveryStatus", default=_pick(order, "carrierTrackingStatus"))
+            carrier = _pick(summary, "carrierName", "deliveryMethod", default=_pick(order, "carrierName"))
+            delivery = " / ".join(str(value) for value in (delivery_status, carrier) if _shown(value)) or "-"
+            source = _pick(summary, "storeName", "saleChannelName", "channelName")
+            if not _shown(source):
+                source = group_name
 
-            city_area = " / ".join(
-                str(value) for value in [_named_value(_pick(address, "city")), _named_value(_pick(address, "area"))]
-                if _shown(value)
-            )
-            customer = _info_table([
-                ("Customer", _pick(address, "customerName")),
-                ("Mobile", _pick(address, "mobile1", "phone")),
-                ("Email", _pick(address, "email")),
-                ("City / Area", city_area),
-                ("Delivery Address", _pick(address, "customerFullAddress", "fullAddress", "streetAddress")),
-                ("Country", _named_value(_pick(address, "countryName", "country"))),
-            ], body_style=body_style, font=font)
-            if customer:
-                story.extend([_section_heading("Customer & Delivery", heading_style), customer])
+            values = [
+                f"#{_order_reference(payload, order_number)}",
+                _format_date(_pick(order, "orderDate", default=_pick(summary, "orderDate"))) or "-",
+                _pick(address, "customerName", default=_pick(summary, "customerName")) or "-",
+                source,
+                _amount(_pick(order, "amount", default=_pick(summary, "amount"))) or "-",
+                payment,
+                order_status or delivery_status or "-",
+                _pick(order, "itemsCount", default=len(items)) if items else _pick(order, "itemsCount", default="-"),
+                delivery,
+                _pick(summary, "carrierTrackingNo", "trackingNo", default=_pick(order, "carrierTrackingNo", "trackingNo")) or "-",
+            ]
+            table_rows.append([_paragraph(value, body_style) for value in values])
 
-            item_table = _items_table(items, body_style=body_style, font=font)
-            if item_table:
-                story.extend([_section_heading("Order Items", heading_style), item_table])
-
-            financial = _info_table([
-                ("Item Value", _amount(_pick(order, "itemValue"))),
-                ("Delivery Charges", _amount(_pick(order, "deliveryCharges"))),
-                ("Shipping Charges", _amount(_pick(order, "cShippingCharges", "shippingCharges"))),
-                ("Discount", _amount(_pick(order, "discount"))),
-                ("VAT / Tax", _amount(_pick(order, "vat", "tax"))),
-                ("Total Amount", _amount(_pick(order, "amount", default=_pick(summary, "amount")))),
-                ("Actual Amount", _amount(_pick(order, "actualAmount"))),
-            ], body_style=body_style, font=font)
-            if financial:
-                story.extend([_section_heading("Payment Summary", heading_style), financial])
-
-            dimensions = []
-            for box in boxes:
-                length, width, height = (
-                    _pick(box, "length"), _pick(box, "width"), _pick(box, "height")
-                )
-                if all(_shown(value) for value in (length, width, height)):
-                    dimensions.append(f"{length} x {width} x {height}")
-            delivery = _info_table([
-                ("Tracking Status", tracking_status),
-                ("Tracking Number", _pick(summary, "carrierTrackingNo", "trackingNo", default=_pick(order, "carrierTrackingNo", "trackingNo"))),
-                ("Carrier", _pick(summary, "carrierName", default=_pick(order, "carrierName"))),
-                ("Weight", _pick(order, "weight")),
-                ("Package Size", "; ".join(dimensions)),
-                ("Packages", len(boxes) if boxes else None),
-            ], body_style=body_style, font=font)
-            if delivery:
-                story.extend([_section_heading("Delivery & Package", heading_style), delivery])
-
-            note_data = payload.get("orderNote") or payload.get("OrderNote") or {}
-            note = _pick(note_data, "note") if isinstance(note_data, dict) else note_data
-            notes = _info_table([
-                ("Description", _pick(order, "description")),
-                ("Remarks", _pick(order, "remarks")),
-                ("Order Note", note),
-            ], body_style=body_style, font=font)
-            if notes:
-                story.extend([_section_heading("Notes", heading_style), notes])
-
-            is_last_order = group_index == len(groups) - 1 and row_index == len(rows) - 1
-            if not is_last_order:
-                story.append(PageBreak())
+    table = Table(
+        table_rows, repeatRows=1,
+        colWidths=[23 * mm, 30 * mm, 33 * mm, 31 * mm, 20 * mm,
+                   23 * mm, 29 * mm, 13 * mm, 38 * mm, 28 * mm],
+    )
+    table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#563AD5")),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+        ("FONTNAME", (0, 0), (-1, -1), font),
+        ("FONTSIZE", (0, 0), (-1, 0), 7),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("GRID", (0, 0), (-1, -1), 0.3, colors.HexColor("#D8DAE1")),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#F7F7FA")]),
+        ("TOPPADDING", (0, 0), (-1, -1), 5),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+        ("ALIGN", (4, 1), (4, -1), "RIGHT"),
+        ("ALIGN", (7, 1), (7, -1), "CENTER"),
+    ]))
+    story.append(table)
 
     def add_footer(canvas, doc):
         canvas.saveState()
         canvas.setFont(font, 7)
         canvas.setFillColor(colors.HexColor("#777A83"))
-        canvas.drawString(15 * mm, 8 * mm, "Shipra - Confidential Order Report")
-        canvas.drawRightString(195 * mm, 8 * mm, f"Page {doc.page}")
+        canvas.drawString(10 * mm, 7 * mm, "Shipra - Confidential Order Report")
+        canvas.drawRightString(287 * mm, 7 * mm, f"Page {doc.page}")
         canvas.restoreState()
 
     document.build(story, onFirstPage=add_footer, onLaterPages=add_footer)
