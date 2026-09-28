@@ -22,7 +22,7 @@ except ImportError:
 from live_api_executor import execute_live_intent
 from live_api_intent import parse_live_api_intent
 from live_response_formatter import format_live_result
-from order_pdf import build_orders_pdf, safe_pdf_filename
+from order_pdf import build_orders_pdf, build_summary_pdf, safe_pdf_filename
 from shipra_api import (
     ShipraAPI,
     ShipraAPIError,
@@ -639,9 +639,11 @@ def _remember_order_export(
     channel_ids=None,
     channel_name=None,
     stores=None,
+    expected_count=None,
 ):
     st.session_state.pop("order_pdf", None)
     st.session_state.last_order_export = {
+        "mode": "orders",
         "intent": intent,
         "from_date": from_date,
         "to_date": to_date,
@@ -650,10 +652,30 @@ def _remember_order_export(
         "channel_ids": list(channel_ids or []),
         "channel_name": channel_name,
         "stores": list(stores or []),
+        "expected_count": (
+            int(expected_count)
+            if expected_count is not None
+            else None
+        ),
     }
 
 
-def _fetch_pdf_orders(api: ShipraAPI, context: dict, *, store_id=None) -> list[dict]:
+def _remember_order_detail_export(summary: str, reference: str):
+    st.session_state.pop("order_pdf", None)
+    st.session_state.last_order_export = {
+        "mode": "detail",
+        "summary": summary,
+        "reference": reference,
+    }
+
+
+def _fetch_pdf_orders(
+    api: ShipraAPI,
+    context: dict,
+    *,
+    store_id=None,
+    expected_count=None,
+) -> list[dict]:
     intent = context["intent"]
     channel_ids = context.get("channel_ids") or []
     rows: list[dict] = []
@@ -687,6 +709,14 @@ def _fetch_pdf_orders(api: ShipraAPI, context: dict, *, store_id=None) -> list[d
         page_total = int(data.get("count") or 0)
         if expected_total is None:
             expected_total = page_total
+            if (
+                expected_count is not None
+                and expected_total != int(expected_count)
+            ):
+                raise ShipraAPIError(
+                    "The filtered order count changed after the answer was shown. "
+                    "Run the order query again before creating its PDF."
+                )
         elif page_total != expected_total:
             raise ShipraAPIError(
                 "Order data changed while the PDF was being created. Please retry."
@@ -727,6 +757,19 @@ def structured_order_pdf_answer(question: str, history=None) -> str | None:
             "Pehle required orders nikalwain, phir `iski PDF file bana do` likhein."
         )
 
+    if context.get("mode") == "detail":
+        reference = str(context.get("reference") or "order")
+        pdf_bytes = build_summary_pdf(
+            title=f"Shipra Order {reference}",
+            summary=str(context.get("summary") or ""),
+        )
+        st.session_state.order_pdf = {
+            "bytes": pdf_bytes,
+            "name": safe_pdf_filename(f"shipra_order_{reference}"),
+            "count": 1,
+        }
+        return "Isi order detail ki PDF tayar hai. Neeche Download PDF button use karein."
+
     auth = st.session_state.get("shipra_auth")
     if not auth:
         return "PDF banane ke liye pehle sidebar se Shipra account connect karein."
@@ -742,6 +785,7 @@ def structured_order_pdf_answer(question: str, history=None) -> str | None:
                     api,
                     context,
                     store_id=int(store["storeId"]),
+                    expected_count=store.get("orderCount"),
                 )
                 if rows:
                     groups.append(
@@ -755,6 +799,7 @@ def structured_order_pdf_answer(question: str, history=None) -> str | None:
                 api,
                 context,
                 store_id=context.get("store_id"),
+                expected_count=context.get("expected_count"),
             )
             groups.append(
                 {
@@ -769,6 +814,11 @@ def structured_order_pdf_answer(question: str, history=None) -> str | None:
 
         intent = context["intent"]
         total = sum(len(group["rows"]) for group in groups)
+        expected_count = context.get("expected_count")
+        if expected_count is not None and total != int(expected_count):
+            raise ShipraAPIError(
+                "The PDF result does not match the count shown in chat. No PDF was created."
+            )
         label = _status_label(intent.status, intent.payment_status, total)
         scope = _date_scope(
             context.get("from_date"),
@@ -936,6 +986,14 @@ def structured_live_answer(question: str, history) -> str | None:
                 updated_auth
             )
 
+            _remember_order_export(
+                intent,
+                from_date,
+                to_date,
+                stores=data.get("stores") or [],
+                expected_count=int(data.get("totalCount") or 0),
+            )
+
             return _format_store_order_counts(
                 data,
                 intent.language,
@@ -948,7 +1006,15 @@ def structured_live_answer(question: str, history) -> str | None:
             else:
                 payload, updated_auth = api.order_by_reference(intent.order_reference)
             st.session_state.shipra_auth = updated_auth
-            return format_order_detail(payload, language=intent.language)
+            detail_summary = format_order_detail(
+                payload,
+                language=intent.language,
+            )
+            _remember_order_detail_export(
+                detail_summary,
+                intent.order_reference,
+            )
+            return detail_summary
         if intent.operation == "list":
             if (
                 grouped_pages
@@ -1022,6 +1088,7 @@ def structured_live_answer(question: str, history) -> str | None:
                         {
                             "storeId": store_id,
                             "storeName": str(item["storeName"]),
+                            "orderCount": int(item["orderCount"]),
                         }
                     )
                 _remember_order_export(
@@ -1029,6 +1096,10 @@ def structured_live_answer(question: str, history) -> str | None:
                     from_date,
                     to_date,
                     stores=export_stores,
+                    expected_count=sum(
+                        int(item["orderCount"])
+                        for item in export_stores
+                    ),
                 )
                 store_count = current_store["orderCount"]
                 label = _status_label(intent.status, intent.payment_status, store_count)
@@ -1090,6 +1161,7 @@ def structured_live_answer(question: str, history) -> str | None:
                 store_name=selected_store_name,
                 channel_ids=selected_channel_ids,
                 channel_name=selected_channel_name,
+                expected_count=total,
             )
             label = _status_label(intent.status, intent.payment_status, total)
             source_name = selected_store_name or selected_channel_name
@@ -1130,6 +1202,16 @@ def structured_live_answer(question: str, history) -> str | None:
                 channel_ids=selected_channel_ids,
             )
             count = int(data.get("count") or 0)
+            _remember_order_export(
+                intent,
+                from_date,
+                to_date,
+                store_id=selected_store_id,
+                store_name=selected_store_name,
+                channel_ids=selected_channel_ids,
+                channel_name=selected_channel_name,
+                expected_count=count,
+            )
             label = _status_label(intent.status, intent.payment_status, count)
             scope = _date_scope(from_date, to_date, intent.language)
             source_name = selected_store_name or selected_channel_name
@@ -1155,6 +1237,12 @@ def structured_live_answer(question: str, history) -> str | None:
             )
         _validated_live_result(data, intent)
         count = data["count"]
+        _remember_order_export(
+            intent,
+            from_date,
+            to_date,
+            expected_count=count,
+        )
         label = _status_label(intent.status, intent.payment_status, count)
         scope = _date_scope(from_date, to_date, intent.language)
         if intent.operation == "count":
@@ -1225,6 +1313,8 @@ with st.sidebar:
         st.success(f"Connected as {st.session_state.shipra_auth.get('username', 'Shipra user')}")
         if st.button("Disconnect Shipra", use_container_width=True):
             st.session_state.pop("shipra_auth", None)
+            st.session_state.pop("last_order_export", None)
+            st.session_state.pop("order_pdf", None)
             st.rerun()
     else:
         with st.form("shipra_login", clear_on_submit=True):
@@ -1294,6 +1384,22 @@ if page_state:
             st.rerun()
 
 pdf_file = st.session_state.get("order_pdf")
+export_context = st.session_state.get("last_order_export")
+if export_context and not pdf_file:
+    if st.button(
+        "Create PDF for this result",
+        use_container_width=True,
+    ):
+        response = structured_order_pdf_answer(
+            "iski PDF file bana do",
+            st.session_state.history,
+        )
+        st.session_state.history.append(
+            {"role": "assistant", "content": response}
+        )
+        st.session_state.scroll_to_latest = True
+        st.rerun()
+
 if pdf_file:
     st.download_button(
         "Download PDF",
@@ -1350,6 +1456,7 @@ if q := st.chat_input("Ask about Shipra code..."):
     is_pdf_request = _is_order_pdf_request(q)
     if not is_pdf_request:
         st.session_state.pop("order_pdf", None)
+        st.session_state.pop("last_order_export", None)
 
     if " ".join(q.lower().strip().split()) not in navigation_words:
         st.session_state.pop("order_page", None)
