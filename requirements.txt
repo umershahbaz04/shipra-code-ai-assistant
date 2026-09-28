@@ -1,6 +1,8 @@
-streamlit>=1.38
-faiss-cpu>=1.8
-sentence-transformers>=3.0
-groq>=0.11
-numpy>=1.26
-requests>=2.32
+streamlit
+faiss-cpu
+sentence-transformers
+google-genai
+groq
+numpy
+requests
+reportlab
